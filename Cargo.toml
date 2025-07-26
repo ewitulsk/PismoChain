@@ -1,0 +1,21 @@
+[workspace]
+members = ["app", "hotstuff_rs"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = []
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# Common dependencies can be defined here and inherited by workspace members
+base64 = "0.21"
+borsh = "0.10"
+ed25519-dalek = { version = "2.0.0", features = ["rand_core"] }
+fern = "0.6"
+log = "0.4" 
+rand = "0.7"
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+sha2 = "0.10"
+typed-builder = "0.16.2" 

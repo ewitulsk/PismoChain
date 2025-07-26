@@ -1,0 +1,11 @@
+[package]
+name = "PismoChain"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "pismochain"
+path = "src/main.rs"
+
+[dependencies]
+hotstuff_rs = { path = "../hotstuff_rs" }
