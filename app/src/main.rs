@@ -1,11 +1,10 @@
 mod mem_db;
+mod jmt_state;
 mod pismo_app_jmt;
 mod transactions;
 mod crypto;
 mod config;
 mod types;
-mod state_jmt;
-use state_jmt as state;
 
 use std::{
     sync::{Arc, Mutex},
@@ -314,13 +313,12 @@ fn main() {
             thread::sleep(Duration::from_millis(300)); // Less frequent queries
             let snapshot = replica.block_tree_camera().snapshot();
                                 // Get counter from HotStuff's committed state (JMT state is managed internally)
-            use crate::state::make_state_key;
+            use crate::jmt_state::make_state_key;
             const COUNTER_ADDR: [u8; 32] = [0u8; 32];
             const COUNTER_TAG: &[u8] = b"counter";
             let counter_key = make_state_key(COUNTER_ADDR, COUNTER_TAG);
             
             let counter_value = if let Some(counter_bytes) = snapshot.committed_app_state(&counter_key) {
-                println!("Raw counter bytes: {:?}", counter_bytes);
                 i64::from_le_bytes(counter_bytes.try_into().unwrap_or([0u8; 8]))
             } else {
                 0

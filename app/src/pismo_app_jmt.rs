@@ -2,15 +2,14 @@
 //! 
 //! This module provides the main application logic with Jellyfish Merkle Tree
 //! integration for verifiable state transitions and inclusion proofs.
+//! JMT is built on top of HotStuff's KVStore, not as a separate layer.
 
 use std::{
-    collections::HashMap,
     sync::{Arc, Mutex},
     thread,
     time::Duration,
+    collections::HashMap,
 };
-
-
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use hotstuff_rs::{
@@ -27,11 +26,11 @@ use hotstuff_rs::{
 
 use sui_sdk::types::crypto::{PublicKey, SignatureScheme};
 
-use crate::mem_db::MemDB;
 use crate::transactions::Transaction;
 use crate::transactions::onramp;
 use crate::config::Config;
-use crate::state::{StateExecutor, make_state_key, make_key_hash_from_parts};
+use crate::jmt_state::{make_state_key, make_key_hash_from_parts, get_jmt_root, get_jmt_value, compute_jmt_updates, get_with_proof};
+use crate::mem_db::MemDB;
 use jmt::{KeyHash, RootHash, OwnedValue, proof::SparseMerkleProof};
 
 /// Counter-specific transaction operations that can be performed
@@ -110,29 +109,16 @@ const COUNTER_TAG: &[u8] = b"counter";
 pub struct PismoAppJMT {
     tx_queue: Arc<Mutex<Vec<PismoTransaction>>>,
     config: Config,
-    state_executor: StateExecutor,
     next_version: u64, // JMT version counter - increments with each transaction
 }
 
 impl PismoAppJMT {
     /// Create a new JMT-enhanced counter app
     pub fn new(tx_queue: Arc<Mutex<Vec<PismoTransaction>>>, config: Config) -> Self {
-        let mut state_executor = StateExecutor::new();
-        
-        // Initialize the counter to 0 at version 0
-        let counter_key_hash = make_key_hash_from_parts(COUNTER_ADDR, COUNTER_TAG);
-        let counter_value = 0i64.to_le_bytes().to_vec();
-        let initial_writes = vec![(counter_key_hash, Some(counter_value))];
-        
-        if let Err(e) = state_executor.execute_block(0, initial_writes) {
-            eprintln!("Failed to initialize state: {}", e);
-        }
-
         Self {
             tx_queue,
             config,
-            state_executor,
-            next_version: 1, // Start at version 1 since we used version 0 for initialization
+            next_version: 1, // Start at version 1, initialization handled by HotStuff
         }
     }
 
@@ -145,11 +131,13 @@ impl PismoAppJMT {
         state
     }
 
-    /// Get the counter value stored in the JMT state
-    pub fn get_counter(&self, version: u64) -> anyhow::Result<i64> {
+    /// Get counter value from the committed HotStuff state (not JMT directly)
+    pub fn get_counter_from_committed_state<K: hotstuff_rs::block_tree::pluggables::KVStore>(
+        block_tree: &hotstuff_rs::block_tree::accessors::app::AppBlockTreeView<K>,
+        version: u64
+    ) -> anyhow::Result<i64> {
         let counter_key_hash = make_key_hash_from_parts(COUNTER_ADDR, COUNTER_TAG);
-        let counter_bytes = self.state_executor
-            .get(counter_key_hash, version)?
+        let counter_bytes = get_jmt_value(block_tree, counter_key_hash, version)?
             .unwrap_or_else(|| 0i64.to_le_bytes().to_vec());
         
         let counter = i64::from_le_bytes(
@@ -160,13 +148,20 @@ impl PismoAppJMT {
     }
 
     /// Get the current state root for a specific version
-    pub fn get_state_root(&self, version: u64) -> Option<RootHash> {
-        self.state_executor.get_root(version)
+    pub fn get_state_root<K: hotstuff_rs::block_tree::pluggables::KVStore>(
+        block_tree: &hotstuff_rs::block_tree::accessors::app::AppBlockTreeView<K>,
+        version: u64
+    ) -> Option<RootHash> {
+        get_jmt_root(block_tree, version)
     }
 
     /// Get proof for a key at a specific version
-    pub fn get_proof(&self, key_hash: KeyHash, version: u64) -> anyhow::Result<(Option<OwnedValue>, SparseMerkleProof<sha2::Sha256>)> {
-        self.state_executor.get_with_proof(key_hash, version)
+    pub fn get_proof<K: hotstuff_rs::block_tree::pluggables::KVStore>(
+        block_tree: &hotstuff_rs::block_tree::accessors::app::AppBlockTreeView<K>,
+        key_hash: KeyHash,
+        version: u64,
+    ) -> anyhow::Result<(Option<OwnedValue>, SparseMerkleProof<sha2::Sha256>)> {
+        get_with_proof(block_tree, key_hash, version)
     }
 }
 
@@ -188,7 +183,8 @@ impl App<MemDB> for PismoAppJMT {
         
         // If no transactions, return early with no state changes
         if transactions_clone.is_empty() {
-            let previous_root = self.state_executor.get_root(start_version.saturating_sub(1))
+            let block_tree = request.block_tree();
+            let previous_root = get_jmt_root(block_tree, start_version.saturating_sub(1))
                 .unwrap_or_else(|| RootHash([0u8; 32]));
             let block_payload = BlockPayload::new(transactions_clone, previous_root, start_version.saturating_sub(1));
             let serialized_payload = block_payload.try_to_vec().unwrap();
@@ -211,11 +207,14 @@ impl App<MemDB> for PismoAppJMT {
         
         // Calculate the final version - this will be the version of the last transaction
         let final_version = start_version + transactions_clone.len() as u64 - 1;
-        
         let block_tree = request.block_tree();
         
         // Execute transactions and get new state root using the final version
-        let (app_state_updates, state_root) = self.execute_jmt(&transactions_clone, &block_tree, final_version);
+        let (app_state_updates, state_root) = self.execute(
+            &transactions_clone, 
+            &block_tree, 
+            final_version
+        );
         
         // Advance the next_version counter for future blocks
         self.next_version = final_version + 1;
@@ -308,7 +307,7 @@ impl App<MemDB> for PismoAppJMT {
             }
 
             // Execute transactions with JMT and verify state root
-            let (app_state_updates, computed_state_root) = self.execute_jmt(&block_payload.transactions, &initial_block_tree, block_version);
+            let (app_state_updates, computed_state_root) = self.execute(&block_payload.transactions, &initial_block_tree, block_version);
             
             // Verify that the computed state root matches the proposed one
             let expected_state_root = block_payload.state_root();
@@ -332,18 +331,19 @@ impl App<MemDB> for PismoAppJMT {
 }
 
 impl PismoAppJMT {
-    /// Execute transactions using real JMT and return both AppStateUpdates and the new state root
-    fn execute_jmt(
-        &mut self, // Changed to mutable to update state_executor
+    /// Execute transactions using JMT read-only view, return AppStateUpdates
+    /// This follows the proper pattern: no persistence, only AppStateUpdates construction
+    fn execute(
+        &self,
         transactions: &[PismoTransaction],
-        _initial_block_tree: &AppBlockTreeView<'_, MemDB>,
-        version: u64, // Use Version instead of block_height for JMT
+        block_tree: &AppBlockTreeView<'_, MemDB>,
+        version: u64,
     ) -> (Option<AppStateUpdates>, RootHash) {
         let counter_key_hash = make_key_hash_from_parts(COUNTER_ADDR, COUNTER_TAG);
         
-        // Get initial counter value from JMT state (previous version's state)
+        // Get initial counter value from committed state (read-only)
         let initial_counter = if version > 0 {
-            match self.state_executor.get(counter_key_hash, version - 1) {
+            match get_jmt_value(block_tree, counter_key_hash, version - 1) {
                 Ok(Some(bytes)) => i64::from_le_bytes(bytes.as_slice().try_into().unwrap_or([0u8; 8])),
                 _ => 0,
             }
@@ -355,7 +355,7 @@ impl PismoAppJMT {
         let user_modifications_in_block: HashMap<String, User> = HashMap::new();
         let mut jmt_writes: Vec<(KeyHash, Option<OwnedValue>)> = Vec::new();
 
-        // Process transactions
+        // Process transactions (business logic)
         for transaction in transactions {
             match &transaction.payload {
                 PismoOperation::Increment => {
@@ -393,49 +393,34 @@ impl PismoAppJMT {
             jmt_writes.push((counter_key_hash, Some(counter_value)));
         }
 
-        // Add user modifications to JMT writes
-        // for (sui_address, updated_user) in &user_modifications_in_block {
-        //     // Create a state key for the user
-        //     let user_addr_bytes: [u8; 32] = sui_address.as_bytes().try_into()
-        //         .unwrap_or_else(|_| {
-        //             // If address is not 32 bytes, hash it
-        //             use sha3::{Digest, Sha3_256};
-        //             let mut hasher = Sha3_256::new();
-        //             hasher.update(sui_address.as_bytes());
-        //             hasher.finalize().into()
-        //         });
-            
-        //     let user_key_hash = make_key_hash_from_parts(user_addr_bytes, b"user");
-        //     let serialized_user = updated_user.try_to_vec().unwrap();
-        //     jmt_writes.push((user_key_hash, Some(serialized_user)));
-        // }
-
-        // Execute JMT state transition using real JMT
-        let state_root = if !jmt_writes.is_empty() {
-            match self.state_executor.execute_block(version, jmt_writes) {
-                Ok(root) => {
-                    println!("🌳 JMT state updated at version {} with root: {:?}", version, hex::encode(&root.as_ref()[..8]));
-                    root
+        // Use JMT to compute the new state root and AppStateUpdates
+        // This follows the correct pattern: read from committed state, compute changes, return updates
+        let has_jmt_changes = !jmt_writes.is_empty();
+        let (state_root, mut jmt_updates) = if has_jmt_changes {
+            match compute_jmt_updates(block_tree, version, jmt_writes) {
+                Ok((root, updates)) => {
+                    println!("🌳 Computed JMT root at version {}: {:?}", version, hex::encode(&root.0[..8]));
+                    (root, updates)
                 }
                 Err(e) => {
-                    eprintln!("❌ JMT execution failed: {}", e);
-                    // Return a zero root as fallback
-                    RootHash([0u8; 32])
+                    eprintln!("❌ JMT computation failed: {}", e);
+                    (RootHash([0u8; 32]), AppStateUpdates::new())
                 }
             }
         } else {
-            // No state changes, return previous root or zero root
-            self.state_executor.get_root(version)
-                .unwrap_or_else(|| RootHash([0u8; 32]))
+            // No state changes, return previous root
+            let prev_root = get_jmt_root(block_tree, version)
+                .unwrap_or_else(|| RootHash([0u8; 32]));
+            (prev_root, AppStateUpdates::new())
         };
 
-        // Create AppStateUpdates for HotStuff compatibility
-        let mut updates = AppStateUpdates::new();
-        let mut has_updates = false;
+        // The JMT updates already contain all the internal JMT operations
+        let mut has_updates = has_jmt_changes;
 
+        // Also add the application-level counter state for HotStuff compatibility
         if counter != initial_counter {
             let counter_state_key = make_state_key(COUNTER_ADDR, COUNTER_TAG);
-            updates.insert(counter_state_key.to_vec(), counter.try_to_vec().unwrap());
+            jmt_updates.insert(counter_state_key.to_vec(), counter.try_to_vec().unwrap());
             has_updates = true;
         }
 
@@ -443,11 +428,11 @@ impl PismoAppJMT {
         for (sui_address, updated_user) in user_modifications_in_block {
             let sui_address_as_bytes = sui_address.as_bytes();
             let serialized_user = updated_user.try_to_vec().unwrap();
-            updates.insert(sui_address_as_bytes.to_vec(), serialized_user);
+            jmt_updates.insert(sui_address_as_bytes.to_vec(), serialized_user);
             has_updates = true;
         }
 
-        let app_state_updates = if has_updates { Some(updates) } else { None };
+        let app_state_updates = if has_updates { Some(jmt_updates) } else { None };
         
         (app_state_updates, state_root)
     }
