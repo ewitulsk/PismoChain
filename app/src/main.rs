@@ -1,5 +1,4 @@
 mod mem_db;
-mod pismo_app;
 mod pismo_app_jmt;
 mod transactions;
 mod crypto;
@@ -18,6 +17,7 @@ use mem_db::MemDB;
 use pismo_app_jmt::{PismoAppJMT, PismoOperation, PismoTransaction};
 use transactions::Transaction;
 use config::load_config;
+use borsh::BorshDeserialize;
 
 // Add Sui SDK imports for signing
 use sui_sdk::types::crypto::{SuiKeyPair, PublicKey, get_key_pair_from_rng};
@@ -38,6 +38,8 @@ use std::{
     sync::mpsc::{self, Receiver, Sender, TryRecvError},
     collections::HashMap,
 };
+
+use crate::pismo_app_jmt::BlockPayload;
 
 // Mock network implementation for single node setup
 #[derive(Clone)]
@@ -312,24 +314,45 @@ fn main() {
             thread::sleep(Duration::from_millis(300)); // Less frequent queries
             let snapshot = replica.block_tree_camera().snapshot();
                                 // Get counter from HotStuff's committed state (JMT state is managed internally)
-            use crate::state::{make_state_key, make_key_hash_from_parts};
+            use crate::state::make_state_key;
             const COUNTER_ADDR: [u8; 32] = [0u8; 32];
             const COUNTER_TAG: &[u8] = b"counter";
             let counter_key = make_state_key(COUNTER_ADDR, COUNTER_TAG);
             
             let counter_value = if let Some(counter_bytes) = snapshot.committed_app_state(&counter_key) {
+                println!("Raw counter bytes: {:?}", counter_bytes);
                 i64::from_le_bytes(counter_bytes.try_into().unwrap_or([0u8; 8]))
             } else {
                 0
             };
             
-            let current_height = 0u64; // Simplified for now [CLAUDE TODO]: This should be version which is the number of transactions
+            // Get the current transaction version from the latest committed block
+            let current_transaction_version = if let Ok(Some(highest_block)) = snapshot.highest_committed_block() {
+                if let Ok(Some(block_data)) = snapshot.block_data(&highest_block) {
+                    if let Some(datum) = block_data.vec().first() {
+                        // Try to deserialize the BlockPayload to get the final_version
+                        if let Ok(block_payload) = BlockPayload::deserialize(
+                            &mut datum.bytes().as_slice()
+                        ) {
+                            block_payload.final_version
+                        } else {
+                            0u64 // If deserialization fails, default to 0
+                        }
+                    } else {
+                        0u64 // If no data in block, default to 0
+                    }
+                } else {
+                    0u64 // If no block data, default to 0
+                }
+            } else {
+                0u64 // If no committed block, default to 0
+            };
             
             if counter_value != last_value {
-                println!("🔢 COUNTER CHANGED: {} → {} ⭐ (Height: {})", last_value, counter_value, current_height);
+                println!("🔢 COUNTER CHANGED: {} → {} ⭐ (TX Version: {})", last_value, counter_value, current_transaction_version);
                 last_value = counter_value;
             } else {
-                print!("🔢 Counter: {} (H: {}) ", counter_value, current_height);
+                print!("🔢 Counter: {} (V: {}) ", counter_value, current_transaction_version);
                 // Print dots to show time passing
                 for _ in 0..3 {
                     thread::sleep(Duration::from_millis(100));

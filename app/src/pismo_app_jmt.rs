@@ -76,13 +76,16 @@ pub struct BlockPayload {
     pub transactions: Vec<PismoTransaction>,
     /// JMT state root after applying all transactions
     pub state_root: [u8; 32], // Keep as [u8; 32] for serialization compatibility
+    /// Final JMT version after applying all transactions in this block
+    pub final_version: u64,
 }
 
 impl BlockPayload {
-    pub fn new(transactions: Vec<PismoTransaction>, state_root: RootHash) -> Self {
+    pub fn new(transactions: Vec<PismoTransaction>, state_root: RootHash, final_version: u64) -> Self {
         Self {
             transactions,
             state_root: state_root.into(), // Convert RootHash to [u8; 32]
+            final_version,
         }
     }
     
@@ -108,6 +111,7 @@ pub struct PismoAppJMT {
     tx_queue: Arc<Mutex<Vec<PismoTransaction>>>,
     config: Config,
     state_executor: StateExecutor,
+    next_version: u64, // JMT version counter - increments with each transaction
 }
 
 impl PismoAppJMT {
@@ -128,6 +132,7 @@ impl PismoAppJMT {
             tx_queue,
             config,
             state_executor,
+            next_version: 1, // Start at version 1 since we used version 0 for initialization
         }
     }
 
@@ -170,22 +175,53 @@ impl App<MemDB> for PismoAppJMT {
         // Reduced sleep time for faster consensus
         thread::sleep(Duration::from_millis(10));
 
-        let (transactions_clone, current_height) = {
+        // Cache the starting version before we dequeue transactions
+        let start_version = self.next_version;
+        
+        let transactions_clone = {
             let mut tx_queue = self.tx_queue.lock().unwrap();
-            let current_height = tx_queue.len() as u64 + 1;
             // Clone transactions to avoid borrowing conflicts
             let transactions_clone = tx_queue.clone();
             tx_queue.clear();
-            (transactions_clone, current_height)
+            transactions_clone
         };
+        
+        // If no transactions, return early with no state changes
+        if transactions_clone.is_empty() {
+            let previous_root = self.state_executor.get_root(start_version.saturating_sub(1))
+                .unwrap_or_else(|| RootHash([0u8; 32]));
+            let block_payload = BlockPayload::new(transactions_clone, previous_root, start_version.saturating_sub(1));
+            let serialized_payload = block_payload.try_to_vec().unwrap();
+            
+            let data = Data::new(vec![Datum::new(serialized_payload)]);
+            let data_hash = {
+                let mut hasher = CryptoHasher::new();
+                hasher.update(&data.vec()[0].bytes());
+                let bytes = hasher.finalize().into();
+                CryptoHash::new(bytes)
+            };
+
+            return ProduceBlockResponse {
+                data_hash,
+                data,
+                app_state_updates: None,
+                validator_set_updates: None,
+            };
+        }
+        
+        // Calculate the final version - this will be the version of the last transaction
+        let final_version = start_version + transactions_clone.len() as u64 - 1;
         
         let block_tree = request.block_tree();
         
-        // Execute transactions and get new state root
-        let (app_state_updates, state_root) = self.execute_jmt(&transactions_clone, &block_tree, current_height);
+        // Execute transactions and get new state root using the final version
+        let (app_state_updates, state_root) = self.execute_jmt(&transactions_clone, &block_tree, final_version);
         
-        // Create enhanced block payload with state root
-        let block_payload = BlockPayload::new(transactions_clone, state_root);
+        // Advance the next_version counter for future blocks
+        self.next_version = final_version + 1;
+        
+        // Create enhanced block payload with state root and final version
+        let block_payload = BlockPayload::new(transactions_clone, state_root, final_version);
         let serialized_payload = block_payload.try_to_vec().unwrap();
         
         let data = Data::new(vec![Datum::new(serialized_payload)]);
@@ -228,13 +264,14 @@ impl App<MemDB> for PismoAppJMT {
         }
 
         let initial_block_tree = request.block_tree();
-        // Use a simple block height for now - in production this would be extracted properly
-        let block_height = 1u64; //[CLAUDE TODO]: Instead of block height, this should be version (each transaction is a version). Implement this correctly
 
         // Deserialize the enhanced block payload
         if let Ok(block_payload) = BlockPayload::deserialize(
             &mut &*request.proposed_block().data.vec()[0].bytes().as_slice(),
         ) {
+            // Use the actual final version from the block payload
+            let block_version = block_payload.final_version;
+
             // Validate all transactions in the block
             for transaction in &block_payload.transactions {
                 // Check if transaction is signed
@@ -271,7 +308,7 @@ impl App<MemDB> for PismoAppJMT {
             }
 
             // Execute transactions with JMT and verify state root
-            let (app_state_updates, computed_state_root) = self.execute_jmt(&block_payload.transactions, &initial_block_tree, block_height);
+            let (app_state_updates, computed_state_root) = self.execute_jmt(&block_payload.transactions, &initial_block_tree, block_version);
             
             // Verify that the computed state root matches the proposed one
             let expected_state_root = block_payload.state_root();
@@ -357,21 +394,21 @@ impl PismoAppJMT {
         }
 
         // Add user modifications to JMT writes
-        for (sui_address, updated_user) in &user_modifications_in_block {
-            // Create a state key for the user
-            let user_addr_bytes: [u8; 32] = sui_address.as_bytes().try_into()
-                .unwrap_or_else(|_| {
-                    // If address is not 32 bytes, hash it
-                    use sha3::{Digest, Sha3_256};
-                    let mut hasher = Sha3_256::new();
-                    hasher.update(sui_address.as_bytes());
-                    hasher.finalize().into()
-                });
+        // for (sui_address, updated_user) in &user_modifications_in_block {
+        //     // Create a state key for the user
+        //     let user_addr_bytes: [u8; 32] = sui_address.as_bytes().try_into()
+        //         .unwrap_or_else(|_| {
+        //             // If address is not 32 bytes, hash it
+        //             use sha3::{Digest, Sha3_256};
+        //             let mut hasher = Sha3_256::new();
+        //             hasher.update(sui_address.as_bytes());
+        //             hasher.finalize().into()
+        //         });
             
-            let user_key_hash = make_key_hash_from_parts(user_addr_bytes, b"user");
-            let serialized_user = updated_user.try_to_vec().unwrap();
-            jmt_writes.push((user_key_hash, Some(serialized_user)));
-        }
+        //     let user_key_hash = make_key_hash_from_parts(user_addr_bytes, b"user");
+        //     let serialized_user = updated_user.try_to_vec().unwrap();
+        //     jmt_writes.push((user_key_hash, Some(serialized_user)));
+        // }
 
         // Execute JMT state transition using real JMT
         let state_root = if !jmt_writes.is_empty() {
@@ -388,7 +425,7 @@ impl PismoAppJMT {
             }
         } else {
             // No state changes, return previous root or zero root
-            self.state_executor.get_root(version.saturating_sub(1))
+            self.state_executor.get_root(version)
                 .unwrap_or_else(|| RootHash([0u8; 32]))
         };
 
