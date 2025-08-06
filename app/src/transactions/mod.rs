@@ -8,7 +8,7 @@ use hotstuff_rs::types::crypto_primitives::{CryptoHasher, Digest};
 // Sui SDK imports for cryptographic operations
 use sui_sdk::types::{
     base_types::SuiAddress,
-    crypto::{SuiKeyPair, PublicKey, SignatureScheme},
+    crypto::{SuiKeyPair, PublicKey},
 };
 
 /// Generic transaction structure that wraps any payload with sender/signer information
@@ -106,4 +106,4 @@ where
     pub fn is_signed(&self) -> bool {
         self.signature.is_some() && self.hash.is_some() && !self.public_key.is_empty()
     }
-} 
+}

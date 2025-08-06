@@ -30,7 +30,7 @@ use crate::transactions::Transaction;
 use crate::transactions::onramp;
 use crate::config::Config;
 use crate::jmt_state::{make_state_key, make_key_hash_from_parts, get_jmt_root, get_jmt_value, compute_jmt_updates, get_with_proof};
-use crate::mem_db::MemDB;
+use hotstuff_rs::block_tree::pluggables::KVStore;
 use jmt::{KeyHash, RootHash, OwnedValue, proof::SparseMerkleProof};
 
 /// Counter-specific transaction operations that can be performed
@@ -165,8 +165,8 @@ impl PismoAppJMT {
     }
 }
 
-impl App<MemDB> for PismoAppJMT {
-    fn produce_block(&mut self, request: ProduceBlockRequest<MemDB>) -> ProduceBlockResponse {
+impl<K: KVStore> App<K> for PismoAppJMT {
+    fn produce_block(&mut self, request: ProduceBlockRequest<K>) -> ProduceBlockResponse {
         // Reduced sleep time for faster consensus
         thread::sleep(Duration::from_millis(10));
 
@@ -239,7 +239,7 @@ impl App<MemDB> for PismoAppJMT {
         }
     }
 
-    fn validate_block(&mut self, request: ValidateBlockRequest<MemDB>) -> ValidateBlockResponse {
+    fn validate_block(&mut self, request: ValidateBlockRequest<K>) -> ValidateBlockResponse {
         // Reduced sleep time for faster consensus
         thread::sleep(Duration::from_millis(10));
 
@@ -248,7 +248,7 @@ impl App<MemDB> for PismoAppJMT {
 
     fn validate_block_for_sync(
         &mut self,
-        request: ValidateBlockRequest<MemDB>,
+        request: ValidateBlockRequest<K>,
     ) -> ValidateBlockResponse {
         let data = &request.proposed_block().data;
         let data_hash: CryptoHash = {
@@ -333,10 +333,10 @@ impl App<MemDB> for PismoAppJMT {
 impl PismoAppJMT {
     /// Execute transactions using JMT read-only view, return AppStateUpdates
     /// This follows the proper pattern: no persistence, only AppStateUpdates construction
-    fn execute(
+    fn execute<K: KVStore>(
         &self,
         transactions: &[PismoTransaction],
-        block_tree: &AppBlockTreeView<'_, MemDB>,
+        block_tree: &AppBlockTreeView<'_, K>,
         version: u64,
     ) -> (Option<AppStateUpdates>, RootHash) {
         let counter_key_hash = make_key_hash_from_parts(COUNTER_ADDR, COUNTER_TAG);

@@ -1,25 +1,30 @@
-mod mem_db;
+mod database;
 mod jmt_state;
 mod pismo_app_jmt;
 mod transactions;
 mod crypto;
 mod config;
 mod types;
+mod standards;
+mod utils;
 
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
     thread,
 };
-
-use mem_db::MemDB;
-use pismo_app_jmt::{PismoAppJMT, PismoOperation, PismoTransaction};
+use utils::{
+    submit_transactions::submit_transaction,
+    sign_transactions::submit_sui_signed_transaction
+};
+use database::mem_db::MemDB;
+use pismo_app_jmt::{PismoAppJMT, PismoOperation};
 use transactions::Transaction;
 use config::load_config;
 use borsh::BorshDeserialize;
 
 // Add Sui SDK imports for signing
-use sui_sdk::types::crypto::{SuiKeyPair, PublicKey, get_key_pair_from_rng};
+use sui_sdk::types::crypto::{SuiKeyPair, get_key_pair_from_rng};
 use rand_core::OsRng;
 
 use hotstuff_rs::{
@@ -92,55 +97,6 @@ impl Network for MockNetwork {
     }
 }
 
-/// Create and sign a new counter transaction with Sui keypair
-fn create_signed_transaction(
-    keypair: &SuiKeyPair,
-    operation: PismoOperation
-) -> anyhow::Result<PismoTransaction> {
-    let mut transaction = Transaction::new(operation);
-    transaction.sign(keypair)?;
-    Ok(transaction)
-}
-
-/// Submit a signed transaction to the transaction queue.
-/// Returns an error if the transaction is not properly signed or fails validation.
-fn submit_transaction(
-    tx_queue: Arc<Mutex<Vec<PismoTransaction>>>,
-    transaction: PismoTransaction, 
-    public_key: &PublicKey
-) -> anyhow::Result<()> {
-    // Validate transaction signature with public key
-    if !transaction.verify(public_key)? {
-        return Err(anyhow::anyhow!("Invalid transaction signature"));
-    }
-
-    if !transaction.is_signed() {
-        return Err(anyhow::anyhow!("Transaction must be signed"));
-    }
-
-    println!("✅ Transaction validated: {:?} from public_key {} (signer: {})", 
-             transaction.payload, transaction.public_key, transaction.signer);
-
-    tx_queue.lock().unwrap().push(transaction);
-    Ok(())
-}
-
-/// Helper function to submit a Sui-signed transaction with error handling
-fn submit_sui_signed_transaction(
-    tx_queue: Arc<Mutex<Vec<PismoTransaction>>>,
-    keypair: &SuiKeyPair,
-    operation: PismoOperation,
-) -> anyhow::Result<()> {
-    let transaction = create_signed_transaction(
-        keypair,
-        operation,
-    )?;
-    
-    let public_key = keypair.public();
-    submit_transaction(tx_queue, transaction, &public_key)?;
-    Ok(())
-}
-
 fn main() {
     println!("🚀 Starting PismoChain Counter App with Transaction Validation...");
     println!("================================================================");
@@ -167,7 +123,11 @@ fn main() {
     println!("   Validator public key: {:?}", validator_keypair.public());
     println!("   HotStuff verifying key: {:?}", verifying_key.to_bytes());
 
-    // Create the KV store
+    // Create the KV store using RocksDB (use default CF for simplicity)
+    // let db_path = "./data/pismo_db";
+    // let kv_store = RocksDBStore::new(db_path)
+    //     .expect("Failed to initialize RocksDB store");
+
     let kv_store = MemDB::new();
 
     // Initialize the app state with counter = 0
@@ -181,9 +141,6 @@ fn main() {
     init_vs.apply_updates(&init_vs_updates);
     let init_vs_state = ValidatorSetState::new(init_vs.clone(), init_vs, None, true);
 
-    // Initialize replica storage
-    Replica::initialize(kv_store.clone(), init_app_state, init_vs_state);
-
     // Create transaction queue for the counter app
     let tx_queue = Arc::new(Mutex::new(Vec::new()));
     let counter_app = PismoAppJMT::new(tx_queue.clone(), config);
@@ -191,7 +148,7 @@ fn main() {
     // Configure the replica with faster view times
     let configuration = Configuration::builder()
         .me(keypair)
-        .chain_id(ChainID::new(9191919))
+        .chain_id(ChainID::new(4206980085))
         .block_sync_request_limit(10)
         .block_sync_server_advertise_time(Duration::new(10, 0))
         .block_sync_response_timeout(Duration::new(3, 0))
@@ -204,7 +161,16 @@ fn main() {
         .log_events(false) // Disable verbose consensus logs
         .build();
 
-    // Build and start the replica
+    // Initialize replica storage first
+    println!("🔧 Initializing replica storage with RocksDB...");
+    let kv_store_for_init = kv_store.clone();
+    Replica::initialize(kv_store_for_init, init_app_state, init_vs_state);
+    println!("✅ Replica storage initialized successfully");
+    
+    // Give RocksDB a moment to ensure all writes are fully persisted
+    thread::sleep(Duration::from_millis(100));
+    
+    // Build and start the replica with the original kv_store
     let replica = ReplicaSpec::builder()
         .app(counter_app)
         .network(MockNetwork::new(verifying_key))
