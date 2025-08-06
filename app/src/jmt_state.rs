@@ -41,6 +41,24 @@ pub fn make_key_hash_from_parts(addr: [u8; 32], struct_tag: &[u8]) -> KeyHash {
 const JMT_NODE_PREFIX: &[u8] = b"__jmt_node__";
 const JMT_VALUE_PREFIX: &[u8] = b"__jmt_value__";
 const JMT_ROOT_PREFIX: &[u8] = b"__jmt_root__";
+/// Prefix for the secondary "latest" index
+const JMT_LATEST_PREFIX: &[u8] = b"__jmt_latest__";
+
+/// Helper to create a latest-value index key for a given KeyHash
+fn make_latest_key(key_hash: KeyHash) -> Vec<u8> {
+    let mut k = Vec::with_capacity(JMT_LATEST_PREFIX.len() + 32);
+    k.extend_from_slice(JMT_LATEST_PREFIX);
+    k.extend_from_slice(&key_hash.0);
+    k
+}
+
+/// Helper to create a value key for consistent key generation
+fn make_value_key(version: Version, key_hash: KeyHash) -> Vec<u8> {
+    let mut value_key = JMT_VALUE_PREFIX.to_vec();
+    value_key.extend_from_slice(&version.to_le_bytes());
+    value_key.extend_from_slice(&key_hash.0);
+    value_key
+}
 
 /// In-memory JMT reader that reads from HotStuff's committed app state
 pub struct AppStateJMTReader<'a, K: KVStore> {
@@ -68,20 +86,20 @@ impl<'a, K: KVStore> TreeReader for AppStateJMTReader<'a, K> {
         max_version: Version,
         key_hash: KeyHash,
     ) -> Result<Option<OwnedValue>> {
-        // Find the most recent value at or before max_version
-        let mut result: Option<(Version, Option<OwnedValue>)> = None;
-        
-        // In a real implementation, you might want to scan through versions
-        // For now, we'll just check the exact version
-        let mut value_key = JMT_VALUE_PREFIX.to_vec();
-        value_key.extend_from_slice(&max_version.to_le_bytes());
-        value_key.extend_from_slice(&key_hash.0);
-        
-        if let Some(value) = self.block_tree.app_state(&value_key) {
-            result = Some((max_version, Some(value)));
+        let latest_key = make_latest_key(key_hash);
+        if let Some(vbytes) = self.block_tree.app_state(&latest_key) {
+            if vbytes.len() >= 8 {
+                let latest = Version::from_le_bytes(vbytes[..8].try_into()?);
+                
+                if latest <= max_version {
+                    let value_key = make_value_key(latest, key_hash);
+                    return Ok(self.block_tree.app_state(&value_key));
+                }
+            }
         }
-        
-        Ok(result.map(|(_, value)| value).flatten())
+
+        // No latest-value index exists, so this key has never been written
+        Ok(None)
     }
 
     fn get_rightmost_leaf(&self) -> Result<Option<(NodeKey, LeafNode)>> {
@@ -162,6 +180,10 @@ pub fn compute_jmt_updates<K: KVStore>(
             Some(val) => updates.insert(key, val.clone()),
             None => updates.delete(key),
         }
+
+        let latest_key = make_latest_key(*key_hash);
+        let version_bytes = val_version.to_le_bytes().to_vec();
+        updates.insert(latest_key, version_bytes);
     }
     
     // Store the new root
