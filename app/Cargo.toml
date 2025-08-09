@@ -12,7 +12,7 @@ hotstuff_rs = { path = "../hotstuff_rs" }
 rand_core = "0.6"
 borsh = "0.10"
 sui-sdk = { git = "https://github.com/mystenlabs/sui", version = "1.54.0" }
-tokio = { version = "1.47.0", features = ["full"] }
+tokio = { version = "1.47.0", features = ["full", "rt-multi-thread", "macros"] }
 anyhow = "1.0.98"
 hex = "0.4.3"
 serde = { version = "1.0", features = ["derive"] }
@@ -26,3 +26,13 @@ sha3 = "0.10"
 sha2 = "0.10"
 bincode = "1"
 rocksdb = { version = "0.23.0", features = ["multi-threaded-cf"] }
+
+# Libp2p dependencies for production networking
+libp2p = { version = "0.54", default-features = false, features = ["tokio", "macros", "dns", "identify", "request-response", "quic"] }
+libp2p-quic = { version = "0.11", features = ["tokio"] }
+libp2p-identity = "0.2"
+multiaddr = "0.18"
+futures = "0.3"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1,0 +1,33 @@
+[sui]
+pismo_locker_address = "0xecbd9e6965d58b933f3dddbc9c45621ad8aa0f4daf11c431a0bbc42aabad850b"
+
+[network]
+# Set to false for multi-node production setup
+single_node_mode = false
+
+# Listen address for this node
+# Each node should use a different port
+listen_addr = "/ip4/0.0.0.0/udp/30333/quic-v1"
+
+# Maximum message size in bytes (default: 10MB)
+max_message_size = 10485760
+
+# Bootstrap peers for connecting to existing network
+# Add the verifying keys and addresses of other nodes in your network
+# Note: In production, verifying keys should be the actual Ed25519 public keys
+# of the validators, not signing keys
+
+[[network.bootstrap_peers]]
+# Node 2 configuration
+verifying_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"  # 32-byte hex
+address = "/ip4/192.168.1.100/udp/30334/quic-v1"
+
+[[network.bootstrap_peers]]
+# Node 3 configuration
+verifying_key = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"  # 32-byte hex
+address = "/ip4/192.168.1.101/udp/30335/quic-v1"
+
+[[network.bootstrap_peers]]
+# Node 4 configuration
+verifying_key = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"  # 32-byte hex
+address = "/ip4/192.168.1.102/udp/30336/quic-v1"

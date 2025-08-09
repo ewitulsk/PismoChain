@@ -1,0 +1,25 @@
+[sui]
+pismo_locker_address = "0xecbd9e6965d58b933f3dddbc9c45621ad8aa0f4daf11c431a0bbc42aabad850b"
+
+[network]
+# Set to true for single-node development mode (uses MockNetwork)
+# Set to false for production multi-node setup (uses libp2p with QUIC)
+single_node_mode = true
+
+# Listen address for libp2p (only used when single_node_mode = false)
+# Format: /ip4/<IP>/udp/<PORT>/quic-v1
+listen_addr = "/ip4/0.0.0.0/udp/30333/quic-v1"
+
+# Maximum message size in bytes (default: 10MB)
+max_message_size = 10485760
+
+# Bootstrap peers for connecting to existing network
+# Only used when single_node_mode = false
+# Uncomment and configure for multi-node setup:
+# [[network.bootstrap_peers]]
+# verifying_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"  # 32-byte hex
+# address = "/ip4/192.168.1.100/udp/30333/quic-v1"
+#
+# [[network.bootstrap_peers]]
+# verifying_key = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"  # 32-byte hex
+# address = "/ip4/192.168.1.101/udp/30333/quic-v1"

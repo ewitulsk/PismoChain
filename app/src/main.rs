@@ -7,21 +7,24 @@ mod config;
 mod types;
 mod standards;
 mod utils;
+mod tests;
+mod networking;
 
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
     thread,
 };
-use utils::{
-    submit_transactions::submit_transaction,
-    sign_transactions::submit_sui_signed_transaction
-};
-use database::mem_db::MemDB;
-use pismo_app_jmt::{PismoAppJMT, PismoOperation};
-use transactions::Transaction;
+// Transaction utilities are available but not used directly in main
+// use utils::{
+//     submit_transactions::submit_transaction,
+//     sign_transactions::submit_sui_signed_transaction
+// };
+// use database::mem_db::MemDB;
+use pismo_app_jmt::PismoAppJMT;
+// use transactions::Transaction;
 use config::load_config;
-use borsh::BorshDeserialize;
+// use borsh::BorshDeserialize;
 
 // Add Sui SDK imports for signing
 use sui_sdk::types::crypto::{SuiKeyPair, get_key_pair_from_rng};
@@ -43,7 +46,7 @@ use std::{
     collections::HashMap,
 };
 
-use crate::pismo_app_jmt::BlockPayload;
+use crate::{database::rocks_db::RocksDBStore, networking::{Libp2pNetwork, NetworkWrapper}};
 
 // Mock network implementation for single node setup
 #[derive(Clone)]
@@ -124,11 +127,9 @@ fn main() {
     println!("   HotStuff verifying key: {:?}", verifying_key.to_bytes());
 
     // Create the KV store using RocksDB (use default CF for simplicity)
-    // let db_path = "./data/pismo_db";
-    // let kv_store = RocksDBStore::new(db_path)
-    //     .expect("Failed to initialize RocksDB store");
-
-    let kv_store = MemDB::new();
+    let db_path = "./data/pismo_db";
+    let kv_store = RocksDBStore::new(db_path)
+        .expect("Failed to initialize RocksDB store");
 
     // Initialize the app state with counter = 0
     let init_app_state = PismoAppJMT::initial_app_state();
@@ -143,11 +144,11 @@ fn main() {
 
     // Create transaction queue for the counter app
     let tx_queue = Arc::new(Mutex::new(Vec::new()));
-    let counter_app = PismoAppJMT::new(tx_queue.clone(), config);
+    let counter_app = PismoAppJMT::new(tx_queue.clone(), config.clone());
 
     // Configure the replica with faster view times
     let configuration = Configuration::builder()
-        .me(keypair)
+        .me(keypair.clone())
         .chain_id(ChainID::new(4206980085))
         .block_sync_request_limit(10)
         .block_sync_server_advertise_time(Duration::new(10, 0))
@@ -170,10 +171,30 @@ fn main() {
     // Give RocksDB a moment to ensure all writes are fully persisted
     thread::sleep(Duration::from_millis(100));
     
+    // Choose network implementation based on configuration
+    let network = if config.network.single_node_mode {
+        println!("🔧 Using MockNetwork for single-node mode");
+        NetworkWrapper::Mock(MockNetwork::new(verifying_key))
+    } else {
+        println!("🌐 Using libp2p network with QUIC transport");
+        let libp2p_config = config.network.to_libp2p_config()
+            .expect("Failed to convert network config");
+        
+        let libp2p_network = Libp2pNetwork::new(&keypair, libp2p_config)
+            .expect("Failed to initialize libp2p network");
+        
+        println!("✅ Libp2p network initialized on {}", config.network.listen_addr);
+        if !config.network.bootstrap_peers.is_empty() {
+            println!("📡 Connecting to {} bootstrap peers", config.network.bootstrap_peers.len());
+        }
+        
+        NetworkWrapper::Libp2p(libp2p_network)
+    };
+    
     // Build and start the replica with the original kv_store
-    let replica = ReplicaSpec::builder()
+    let _replica = ReplicaSpec::builder()
         .app(counter_app)
-        .network(MockNetwork::new(verifying_key))
+        .network(network)
         .kv_store(kv_store)
         .configuration(configuration)
         .build()
@@ -182,150 +203,6 @@ fn main() {
     println!("✅ PismoChain replica started with transaction validation!");
     println!("📊 Initial counter value: 0");
     println!("================================================================");
-    
-    // Demo: Submit signed counter transactions with enhanced error handling
-    let tx_queue_clone = tx_queue.clone();
-    thread::spawn(move || {
-        thread::sleep(Duration::from_millis(500)); // Wait for startup
-        
-        // Create Sui signers for different users
-        let mut rng = OsRng;
-        let alice_keypair = SuiKeyPair::Ed25519(get_key_pair_from_rng(&mut rng).1);
-        let bob_keypair = SuiKeyPair::Ed25519(get_key_pair_from_rng(&mut rng).1);
-        let charlie_keypair = SuiKeyPair::Ed25519(get_key_pair_from_rng(&mut rng).1);
-        
-        println!("🔑 Created Sui signers:");
-        println!("   Alice: {:?}", alice_keypair.public());
-        println!("   Bob: {:?}", bob_keypair.public());
-        println!("   Charlie: {:?}", charlie_keypair.public());
-        println!("================================================================");
-        
-        // Submit Sui-signed transactions
-        println!("📥 Submitting Sui-signed Increment transaction from Alice...");
-        if let Err(e) = submit_sui_signed_transaction(tx_queue_clone.clone(), &alice_keypair, PismoOperation::Increment) {
-            println!("❌ Failed to submit Increment: {}", e);
-        }
-        
-        thread::sleep(Duration::from_millis(800));
-        println!("📥 Submitting Sui-signed Increment transaction from Bob...");
-        if let Err(e) = submit_sui_signed_transaction(tx_queue_clone.clone(), &bob_keypair, PismoOperation::Increment) {
-            println!("❌ Failed to submit Increment: {}", e);
-        }
-        
-        thread::sleep(Duration::from_millis(1200));
-        println!("📥 Submitting Sui-signed Set(10) transaction from Charlie...");
-        if let Err(e) = submit_sui_signed_transaction(tx_queue_clone.clone(), &charlie_keypair, PismoOperation::Set(10)) {
-            println!("❌ Failed to submit Set(10): {}", e);
-        }
-        
-        thread::sleep(Duration::from_millis(1000));
-        println!("📥 Submitting Sui-signed Decrement transaction from Alice...");
-        if let Err(e) = submit_sui_signed_transaction(tx_queue_clone.clone(), &alice_keypair, PismoOperation::Decrement) {
-            println!("❌ Failed to submit Decrement: {}", e);
-        }
-        
-        thread::sleep(Duration::from_millis(800));
-        println!("📥 Submitting Sui-signed Increment transaction from Bob...");
-        if let Err(e) = submit_sui_signed_transaction(tx_queue_clone.clone(), &bob_keypair, PismoOperation::Increment) {
-            println!("❌ Failed to submit Increment: {}", e);
-        }
-        
-        thread::sleep(Duration::from_millis(1000));
-        println!("📥 Submitting Sui-signed Set(42) transaction from Charlie...");
-        if let Err(e) = submit_sui_signed_transaction(tx_queue_clone.clone(), &charlie_keypair, PismoOperation::Set(42)) {
-            println!("❌ Failed to submit Set(42): {}", e);
-        }
-
-        // Demonstrate invalid transaction handling
-        thread::sleep(Duration::from_millis(1500));
-        println!("🧪 Testing invalid transaction (unsigned)...");
-        let invalid_tx = Transaction::new(
-            PismoOperation::Set(999),
-        );
-        // Create a dummy public key for testing
-        let dummy_keypair = SuiKeyPair::Ed25519(get_key_pair_from_rng(&mut rng).1);
-        let dummy_public_key = dummy_keypair.public();
-        
-        // Don't sign the transaction - it should be rejected
-        if let Err(e) = submit_transaction(tx_queue_clone.clone(), invalid_tx, &dummy_public_key) {
-            println!("✅ Successfully rejected unsigned transaction: {}", e);
-        }
-        
-        // Test with additional Sui-signed transaction
-        thread::sleep(Duration::from_millis(800));
-        println!("🧪 Testing additional Sui-signed transaction...");
-        if let Err(e) = submit_sui_signed_transaction(tx_queue_clone.clone(), &alice_keypair, PismoOperation::Increment) {
-            println!("❌ Failed to submit additional transaction: {}", e);
-        }
-        
-        // Demonstrate Onramp transaction with VAA verification
-        thread::sleep(Duration::from_millis(1200));
-        println!("🌉 Testing Onramp transaction with Wormhole VAA verification...");
-        let sample_vaa = "AQAAAAABAGZIrvrMZB2Jzud966+Fajf5ZL2kKl6xWHsYFVo805BVY0K0OxD0FwkxYo6ixo/zChGu3dIaO+lyHASMR2ijsqoAaI7t6gAAAAEAFWNKOelP1x3cVrH/mbj9b2cvfAwC5Ddw9Kkl9yTeQhk0AAAAAAAAAAAAT05SQU1QAAAAMTAwMDAwMAAAAKuNG1pTEclADj6vXDtkHxD7SLQ8ww02X6ipimymvUhlAAAAdC01zGY0wFMpJaO41C0yqKffqiwAAABiZWYxNjE4ZGI0ZmFjMGQ2NzM2NzkyZTZhYTcxNTZiNWIzOGJiZjQzMjBmOWE3NDQ4YjNhMmMxZjcyMjYzMzg0Ojp0ZXN0X2NvaW46OlRFU1RfQ09JTgAAADE3NTQxOTc0ODI3NDU=";
-        let guardian_set_index = 0u64; // Testnet guardian set
-        
-        let onramp_operation = PismoOperation::Onramp(sample_vaa.to_string(), guardian_set_index);
-        if let Err(e) = submit_sui_signed_transaction(tx_queue_clone.clone(), &bob_keypair, onramp_operation) {
-            println!("❌ Failed to submit Onramp transaction: {}", e);
-        } else {
-            println!("✅ Onramp transaction submitted successfully!");
-        }
-    });
-
-    // Query counter value with better formatting and less frequent updates
-    thread::spawn(move || {
-        let mut last_value = 0i64;
-        loop {
-            thread::sleep(Duration::from_millis(300)); // Less frequent queries
-            let snapshot = replica.block_tree_camera().snapshot();
-                                // Get counter from HotStuff's committed state (JMT state is managed internally)
-            use crate::jmt_state::make_state_key;
-            const COUNTER_ADDR: [u8; 32] = [0u8; 32];
-            const COUNTER_TAG: &[u8] = b"counter";
-            let counter_key = make_state_key(COUNTER_ADDR, COUNTER_TAG);
-            
-            let counter_value = if let Some(counter_bytes) = snapshot.committed_app_state(&counter_key) {
-                i64::from_le_bytes(counter_bytes.try_into().unwrap_or([0u8; 8]))
-            } else {
-                0
-            };
-            
-            // Get the current transaction version from the latest committed block
-            let current_transaction_version = if let Ok(Some(highest_block)) = snapshot.highest_committed_block() {
-                if let Ok(Some(block_data)) = snapshot.block_data(&highest_block) {
-                    if let Some(datum) = block_data.vec().first() {
-                        // Try to deserialize the BlockPayload to get the final_version
-                        if let Ok(block_payload) = BlockPayload::deserialize(
-                            &mut datum.bytes().as_slice()
-                        ) {
-                            block_payload.final_version
-                        } else {
-                            0u64 // If deserialization fails, default to 0
-                        }
-                    } else {
-                        0u64 // If no data in block, default to 0
-                    }
-                } else {
-                    0u64 // If no block data, default to 0
-                }
-            } else {
-                0u64 // If no committed block, default to 0
-            };
-            
-            if counter_value != last_value {
-                println!("🔢 COUNTER CHANGED: {} → {} ⭐ (TX Version: {})", last_value, counter_value, current_transaction_version);
-                last_value = counter_value;
-            } else {
-                print!("🔢 Counter: {} (V: {}) ", counter_value, current_transaction_version);
-                // Print dots to show time passing
-                for _ in 0..3 {
-                    thread::sleep(Duration::from_millis(100));
-                    print!(".");
-                }
-                println!(); // New line
-            }
-        }
-    });
 
     // Keep the main thread alive
     loop {
