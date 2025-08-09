@@ -5,6 +5,7 @@ use std::env;
 /// Main configuration structure for the PismoChain CounterApp
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    pub chain_id: u16,
     pub sui: Sui,
 }
 

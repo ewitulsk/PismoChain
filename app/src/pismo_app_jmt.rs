@@ -32,18 +32,29 @@ use crate::config::Config;
 use crate::jmt_state::{make_state_key, make_key_hash_from_parts, get_jmt_root, get_jmt_value, compute_jmt_updates, get_with_proof};
 use hotstuff_rs::block_tree::pluggables::KVStore;
 use jmt::{KeyHash, RootHash, OwnedValue, proof::SparseMerkleProof};
+use crate::standards::accounts::{Chain, AccountAddr};
+use crate::transactions::accounts::{build_create_account_updates, build_link_account_updates};
+use std::collections::BTreeMap;
+use borsh::{BorshSerialize as _, BorshDeserialize as _};
 
 /// Counter-specific transaction operations that can be performed
 #[derive(Clone, BorshSerialize, BorshDeserialize, Debug, serde::Serialize)]
 pub enum PismoOperation {
-    /// Increase the counter by 1
-    Increment,
-    /// Decrease the counter by 1
-    Decrement,
-    /// Set the counter to a specific value
-    Set(i64),
     /// Process an onramp transaction with VAA verification
     Onramp(String, u64), // vaa string, guardian_set index
+    /// Create a new account from an external wallet link
+    CreateAccount {
+        chain: Chain,
+        external_addr: Vec<u8>,
+        created_at_ms: u64,
+    },
+    /// Link a new external wallet to an existing account
+    LinkAccount {
+        account_addr: AccountAddr,
+        chain: Chain,
+        external_addr: Vec<u8>,
+        added_at_ms: u64,
+    },
 }
 
 /// Type alias for counter transactions
@@ -339,34 +350,26 @@ impl PismoAppJMT {
         block_tree: &AppBlockTreeView<'_, K>,
         version: u64,
     ) -> (Option<AppStateUpdates>, RootHash) {
-        let counter_key_hash = make_key_hash_from_parts(COUNTER_ADDR, COUNTER_TAG);
-        
-        // Get initial counter value from committed state (read-only)
-        let initial_counter = if version > 0 {
-            match get_jmt_value(block_tree, counter_key_hash, version - 1) {
-                Ok(Some(bytes)) => i64::from_le_bytes(bytes.as_slice().try_into().unwrap_or([0u8; 8])),
-                _ => 0,
-            }
-        } else {
-            0
-        };
-        
-        let mut counter = initial_counter;
         let user_modifications_in_block: HashMap<String, User> = HashMap::new();
         let mut jmt_writes: Vec<(KeyHash, Option<OwnedValue>)> = Vec::new();
+        let mut app_mirror_inserts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
 
         // Process transactions (business logic)
         for transaction in transactions {
+            // Chain id enforcement
+            if transaction.chain_id != self.config.chain_id {
+                println!("❌ Tx rejected: wrong chain_id {} (expected {})", transaction.chain_id, self.config.chain_id);
+                continue;
+            }
+
+            // Signature presence check (detailed verification per key type can be added here)
+            if !transaction.is_signed() {
+                println!("❌ Tx rejected: not signed");
+                continue;
+            }
+
             match &transaction.payload {
-                PismoOperation::Increment => {
-                    counter += 1;
-                }
-                PismoOperation::Decrement => {
-                    counter -= 1;
-                }
-                PismoOperation::Set(value) => {
-                    counter = *value;
-                }
+                // Remove counter-only transactions per new requirements
                 PismoOperation::Onramp(vaa, guardian_set_index) => {
                     // Verify VAA and extract onramp message
                     match onramp::verify_vaa_and_extract_message(vaa, *guardian_set_index) {
@@ -384,14 +387,47 @@ impl PismoAppJMT {
                         }
                     }
                 }
+                PismoOperation::CreateAccount { chain, external_addr, created_at_ms } => {
+                    let (writes, mirrors) = build_create_account_updates(*chain, external_addr.clone(), *created_at_ms, block_tree, version);
+                    jmt_writes.extend(writes);
+                    app_mirror_inserts.extend(mirrors);
+                }
+                PismoOperation::LinkAccount { account_addr, chain, external_addr, added_at_ms } => {
+                    // Nonce check and increment
+                    let acct_key = make_key_hash_from_parts(*account_addr, b"acct");
+                    let existing = get_jmt_value(block_tree, acct_key, version.saturating_sub(1)).ok().flatten();
+                    if let Some(bytes) = existing {
+                        if let Ok(mut account) = bcs::from_bytes::<crate::standards::accounts::Account>(&bytes) {
+                            if transaction.nonce != account.meta.current_nonce {
+                                println!("❌ Tx rejected: bad nonce {} (expected {})", transaction.nonce, account.meta.current_nonce);
+                                continue;
+                            }
+                            // Build updates and then override account bytes with incremented nonce
+                            let (mut writes, mut mirrors) = build_link_account_updates(*account_addr, *chain, external_addr.clone(), *added_at_ms, block_tree, version);
+                            account.meta.current_nonce = account.meta.current_nonce.saturating_add(1);
+                            let acct_bytes = bcs::to_bytes(&account).unwrap();
+                            if let Some(pos) = writes.iter().position(|(k, _)| *k == acct_key) {
+                                writes[pos] = (acct_key, Some(acct_bytes.clone()));
+                            }
+                            // Replace mirror acct
+                            let acct_obj_key = crate::standards::accounts::make_account_object_key(account_addr);
+                            if let Some(mpos) = mirrors.iter().position(|(k, _)| *k == acct_obj_key) {
+                                mirrors[mpos] = (acct_obj_key, acct_bytes);
+                            }
+                            jmt_writes.extend(writes);
+                            app_mirror_inserts.extend(mirrors);
+                        } else {
+                            println!("❌ Tx rejected: failed to decode account");
+                        }
+                    } else {
+                        println!("❌ Tx rejected: account missing");
+                    }
+                }
             }
         }
 
         // Prepare JMT writes using proper KeyHash and OwnedValue types
-        if counter != initial_counter {
-            let counter_value = counter.to_le_bytes().to_vec();
-            jmt_writes.push((counter_key_hash, Some(counter_value)));
-        }
+        // No-op for counter state now
 
         // Use JMT to compute the new state root and AppStateUpdates
         // This follows the correct pattern: read from committed state, compute changes, return updates
@@ -418,17 +454,21 @@ impl PismoAppJMT {
         let mut has_updates = has_jmt_changes;
 
         // Also add the application-level counter state for HotStuff compatibility
-        if counter != initial_counter {
-            let counter_state_key = make_state_key(COUNTER_ADDR, COUNTER_TAG);
-            jmt_updates.insert(counter_state_key.to_vec(), counter.try_to_vec().unwrap());
-            has_updates = true;
-        }
+        // No-op mirror for counter now
 
         // Write user modifications to AppStateUpdates as well
         for (sui_address, updated_user) in user_modifications_in_block {
             let sui_address_as_bytes = sui_address.as_bytes();
             let serialized_user = updated_user.try_to_vec().unwrap();
             jmt_updates.insert(sui_address_as_bytes.to_vec(), serialized_user);
+            has_updates = true;
+        }
+
+        // Apply any app-level mirror inserts
+        if !app_mirror_inserts.is_empty() {
+            for (k, v) in app_mirror_inserts {
+                jmt_updates.insert(k, v);
+            }
             has_updates = true;
         }
 

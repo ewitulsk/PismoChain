@@ -1,2 +1,4 @@
+chain_id = 2
+
 [sui]
 pismo_locker_address = "0xecbd9e6965d58b933f3dddbc9c45621ad8aa0f4daf11c431a0bbc42aabad850b"

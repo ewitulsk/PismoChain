@@ -143,7 +143,7 @@ fn main() {
 
     // Create transaction queue for the counter app
     let tx_queue = Arc::new(Mutex::new(Vec::new()));
-    let counter_app = PismoAppJMT::new(tx_queue.clone(), config);
+    let pismo_app = PismoAppJMT::new(tx_queue.clone(), config.clone());
 
     // Configure the replica with faster view times
     let configuration = Configuration::builder()
@@ -172,7 +172,7 @@ fn main() {
     
     // Build and start the replica with the original kv_store
     let replica = ReplicaSpec::builder()
-        .app(counter_app)
+        .app(pismo_app)
         .network(MockNetwork::new(verifying_key))
         .kv_store(kv_store)
         .configuration(configuration)
@@ -183,8 +183,9 @@ fn main() {
     println!("📊 Initial counter value: 0");
     println!("================================================================");
     
-    // Demo: Submit signed counter transactions with enhanced error handling
+    // Demo: Submit Sui-signed transactions (adjusted to new ops)
     let tx_queue_clone = tx_queue.clone();
+    let cfg_chain_id = config.chain_id;
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(500)); // Wait for startup
         
@@ -192,71 +193,29 @@ fn main() {
         let mut rng = OsRng;
         let alice_keypair = SuiKeyPair::Ed25519(get_key_pair_from_rng(&mut rng).1);
         let bob_keypair = SuiKeyPair::Ed25519(get_key_pair_from_rng(&mut rng).1);
-        let charlie_keypair = SuiKeyPair::Ed25519(get_key_pair_from_rng(&mut rng).1);
         
         println!("🔑 Created Sui signers:");
         println!("   Alice: {:?}", alice_keypair.public());
         println!("   Bob: {:?}", bob_keypair.public());
-        println!("   Charlie: {:?}", charlie_keypair.public());
+        println!("   Charlie: {:?}", alice_keypair.public());
         println!("================================================================");
         
-        // Submit Sui-signed transactions
-        println!("📥 Submitting Sui-signed Increment transaction from Alice...");
-        if let Err(e) = submit_sui_signed_transaction(tx_queue_clone.clone(), &alice_keypair, PismoOperation::Increment) {
-            println!("❌ Failed to submit Increment: {}", e);
-        }
+        // CreateAccount for Alice
+        let create_acct = PismoOperation::CreateAccount { chain: crate::standards::accounts::Chain::SolanaEd25519, external_addr: vec![0u8; 32], created_at_ms: 0 };
+        let mut tx = Transaction::new(create_acct, 0, cfg_chain_id);
+        tx.chain_id = cfg_chain_id;
+        tx.nonce = 0;
+        tx.sign(&alice_keypair).ok();
+        let _ = submit_transaction(tx_queue_clone.clone(), tx, &alice_keypair.public());
         
         thread::sleep(Duration::from_millis(800));
-        println!("📥 Submitting Sui-signed Increment transaction from Bob...");
-        if let Err(e) = submit_sui_signed_transaction(tx_queue_clone.clone(), &bob_keypair, PismoOperation::Increment) {
-            println!("❌ Failed to submit Increment: {}", e);
-        }
-        
-        thread::sleep(Duration::from_millis(1200));
-        println!("📥 Submitting Sui-signed Set(10) transaction from Charlie...");
-        if let Err(e) = submit_sui_signed_transaction(tx_queue_clone.clone(), &charlie_keypair, PismoOperation::Set(10)) {
-            println!("❌ Failed to submit Set(10): {}", e);
-        }
-        
-        thread::sleep(Duration::from_millis(1000));
-        println!("📥 Submitting Sui-signed Decrement transaction from Alice...");
-        if let Err(e) = submit_sui_signed_transaction(tx_queue_clone.clone(), &alice_keypair, PismoOperation::Decrement) {
-            println!("❌ Failed to submit Decrement: {}", e);
-        }
-        
-        thread::sleep(Duration::from_millis(800));
-        println!("📥 Submitting Sui-signed Increment transaction from Bob...");
-        if let Err(e) = submit_sui_signed_transaction(tx_queue_clone.clone(), &bob_keypair, PismoOperation::Increment) {
-            println!("❌ Failed to submit Increment: {}", e);
-        }
-        
-        thread::sleep(Duration::from_millis(1000));
-        println!("📥 Submitting Sui-signed Set(42) transaction from Charlie...");
-        if let Err(e) = submit_sui_signed_transaction(tx_queue_clone.clone(), &charlie_keypair, PismoOperation::Set(42)) {
-            println!("❌ Failed to submit Set(42): {}", e);
-        }
-
-        // Demonstrate invalid transaction handling
-        thread::sleep(Duration::from_millis(1500));
-        println!("🧪 Testing invalid transaction (unsigned)...");
-        let invalid_tx = Transaction::new(
-            PismoOperation::Set(999),
-        );
-        // Create a dummy public key for testing
-        let dummy_keypair = SuiKeyPair::Ed25519(get_key_pair_from_rng(&mut rng).1);
-        let dummy_public_key = dummy_keypair.public();
-        
-        // Don't sign the transaction - it should be rejected
-        if let Err(e) = submit_transaction(tx_queue_clone.clone(), invalid_tx, &dummy_public_key) {
-            println!("✅ Successfully rejected unsigned transaction: {}", e);
-        }
-        
-        // Test with additional Sui-signed transaction
-        thread::sleep(Duration::from_millis(800));
-        println!("🧪 Testing additional Sui-signed transaction...");
-        if let Err(e) = submit_sui_signed_transaction(tx_queue_clone.clone(), &alice_keypair, PismoOperation::Increment) {
-            println!("❌ Failed to submit additional transaction: {}", e);
-        }
+        // LinkAccount (will likely fail nonce/account unless correct addr is used; this is just a flow demo)
+        let link = PismoOperation::LinkAccount { account_addr: [0u8;32], chain: crate::standards::accounts::Chain::SolanaEd25519, external_addr: vec![1u8;32], added_at_ms: 0 };
+        let mut tx2 = Transaction::new(link, 1, cfg_chain_id);
+        tx2.chain_id = cfg_chain_id;
+        tx2.nonce = 0;
+        tx2.sign(&bob_keypair).ok();
+        let _ = submit_transaction(tx_queue_clone.clone(), tx2, &bob_keypair.public());
         
         // Demonstrate Onramp transaction with VAA verification
         thread::sleep(Duration::from_millis(1200));
@@ -265,16 +224,16 @@ fn main() {
         let guardian_set_index = 0u64; // Testnet guardian set
         
         let onramp_operation = PismoOperation::Onramp(sample_vaa.to_string(), guardian_set_index);
-        if let Err(e) = submit_sui_signed_transaction(tx_queue_clone.clone(), &bob_keypair, onramp_operation) {
+        if let Err(e) = submit_sui_signed_transaction(tx_queue_clone.clone(), &bob_keypair, onramp_operation, 2, cfg_chain_id) {
             println!("❌ Failed to submit Onramp transaction: {}", e);
         } else {
             println!("✅ Onramp transaction submitted successfully!");
         }
     });
 
-    // Query counter value with better formatting and less frequent updates
+        // Query with less frequent updates
     thread::spawn(move || {
-        let mut last_value = 0i64;
+            let mut last_value = 0i64;
         loop {
             thread::sleep(Duration::from_millis(300)); // Less frequent queries
             let snapshot = replica.block_tree_camera().snapshot();
