@@ -32,7 +32,6 @@ pub fn submit_sui_signed_transaction(
         chain_id
     )?;
     
-    let public_key = keypair.public();
-    submit_transaction(tx_queue, transaction, &public_key)?;
+    submit_transaction(tx_queue, transaction, chain_id)?;
     Ok(())
 }

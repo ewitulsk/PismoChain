@@ -26,7 +26,12 @@ sha3 = "0.10"
 sha2 = "0.10"
 bincode = "1"
 rocksdb = { version = "0.23.0", features = ["multi-threaded-cf"] }
-bcs = "0.1.6"
 bitflags = { version = "2", features = ["serde"] }
 bs58 = "0.5"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+jsonrpsee = { version = "0.25", features = ["server", "macros", "tokio"] }
+jsonrpsee-http-server = "0.15.1"
+jsonrpsee-types = "0.25.1"
+tracing = "0.1.41"
+blake2 = "0.10"
+bcs = "0.1"

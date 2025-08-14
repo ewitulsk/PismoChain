@@ -24,7 +24,7 @@ use hotstuff_rs::{
     },
 };
 
-use sui_sdk::types::crypto::{PublicKey, SignatureScheme};
+// No direct use of Sui PublicKey needed for verification path now
 
 use crate::transactions::Transaction;
 use crate::transactions::onramp;
@@ -34,8 +34,7 @@ use hotstuff_rs::block_tree::pluggables::KVStore;
 use jmt::{KeyHash, RootHash, OwnedValue, proof::SparseMerkleProof};
 use crate::standards::accounts::{Chain, AccountAddr};
 use crate::transactions::accounts::{build_create_account_updates, build_link_account_updates};
-use std::collections::BTreeMap;
-use borsh::{BorshSerialize as _, BorshDeserialize as _};
+ 
 
 /// Counter-specific transaction operations that can be performed
 #[derive(Clone, BorshSerialize, BorshDeserialize, Debug, serde::Serialize)]
@@ -45,14 +44,12 @@ pub enum PismoOperation {
     /// Create a new account from an external wallet link
     CreateAccount {
         chain: Chain,
-        external_addr: Vec<u8>,
         created_at_ms: u64,
     },
     /// Link a new external wallet to an existing account
     LinkAccount {
         account_addr: AccountAddr,
         chain: Chain,
-        external_addr: Vec<u8>,
         added_at_ms: u64,
     },
 }
@@ -179,7 +176,7 @@ impl PismoAppJMT {
 impl<K: KVStore> App<K> for PismoAppJMT {
     fn produce_block(&mut self, request: ProduceBlockRequest<K>) -> ProduceBlockResponse {
         // Reduced sleep time for faster consensus
-        thread::sleep(Duration::from_millis(10));
+        thread::sleep(Duration::from_millis(100));
 
         // Cache the starting version before we dequeue transactions
         let start_version = self.next_version;
@@ -282,38 +279,22 @@ impl<K: KVStore> App<K> for PismoAppJMT {
             // Use the actual final version from the block payload
             let block_version = block_payload.final_version;
 
-            // Validate all transactions in the block
+            // Validate all transactions in the block (signature, chain id, nonce)
             for transaction in &block_payload.transactions {
-                // Check if transaction is signed
                 if !transaction.is_signed() {
                     println!("❌ Transaction validation failed: Transaction not signed");
                     return ValidateBlockResponse::Invalid;
                 }
-                
-                // Reconstruct public key from the transaction's stored public_key hex string
-                if let Ok(public_key_bytes) = hex::decode(&transaction.public_key) {
-                    if let Ok(public_key) = PublicKey::try_from_bytes(SignatureScheme::ED25519, &public_key_bytes) {
-                        match transaction.verify(&public_key) {
-                            Ok(true) => {
-                                // Transaction is valid, continue
-                            }
-                            Ok(false) => {
-                                println!("❌ Transaction validation failed: Invalid signature for public_key {}", 
-                                         transaction.public_key);
-                                return ValidateBlockResponse::Invalid;
-                            }
-                            Err(e) => {
-                                println!("❌ Transaction validation failed: Verification error: {}", e);
-                                return ValidateBlockResponse::Invalid;
-                            }
-                        }
-                    } else {
-                        println!("❌ Transaction validation failed: Invalid public key format");
+                match transaction.verify_with_state(self.config.chain_id, &initial_block_tree, block_version) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        println!("❌ Transaction validation failed: signature/chain/nonce check failed for public_key {}", transaction.public_key);
                         return ValidateBlockResponse::Invalid;
                     }
-                } else {
-                    println!("❌ Transaction validation failed: Could not decode public key hex");
-                    return ValidateBlockResponse::Invalid;
+                    Err(e) => {
+                        println!("❌ Transaction validation failed: Verification error: {}", e);
+                        return ValidateBlockResponse::Invalid;
+                    }
                 }
             }
 
@@ -356,17 +337,20 @@ impl PismoAppJMT {
 
         // Process transactions (business logic)
         for transaction in transactions {
-            // Chain id enforcement
-            if transaction.chain_id != self.config.chain_id {
-                println!("❌ Tx rejected: wrong chain_id {} (expected {})", transaction.chain_id, self.config.chain_id);
-                continue;
+            // Chain id + signature + nonce checks using stateful verifier
+            match transaction.verify_with_state(self.config.chain_id, block_tree, version) {
+                Ok(true) => {}
+                Ok(false) => {
+                    println!("❌ Tx rejected by verification (chain_id/signature/nonce)");
+                    continue;
+                }
+                Err(e) => {
+                    println!("❌ Tx verification error: {}", e);
+                    continue;
+                }
             }
 
-            // Signature presence check (detailed verification per key type can be added here)
-            if !transaction.is_signed() {
-                println!("❌ Tx rejected: not signed");
-                continue;
-            }
+            let signing_pub_key = transaction.public_key.clone();
 
             match &transaction.payload {
                 // Remove counter-only transactions per new requirements
@@ -387,41 +371,15 @@ impl PismoAppJMT {
                         }
                     }
                 }
-                PismoOperation::CreateAccount { chain, external_addr, created_at_ms } => {
-                    let (writes, mirrors) = build_create_account_updates(*chain, external_addr.clone(), *created_at_ms, block_tree, version);
+                PismoOperation::CreateAccount { chain, created_at_ms } => {
+                    let (writes, mirrors) = build_create_account_updates(*chain, signing_pub_key.clone(), *created_at_ms, block_tree, version);
                     jmt_writes.extend(writes);
                     app_mirror_inserts.extend(mirrors);
                 }
-                PismoOperation::LinkAccount { account_addr, chain, external_addr, added_at_ms } => {
-                    // Nonce check and increment
-                    let acct_key = make_key_hash_from_parts(*account_addr, b"acct");
-                    let existing = get_jmt_value(block_tree, acct_key, version.saturating_sub(1)).ok().flatten();
-                    if let Some(bytes) = existing {
-                        if let Ok(mut account) = bcs::from_bytes::<crate::standards::accounts::Account>(&bytes) {
-                            if transaction.nonce != account.meta.current_nonce {
-                                println!("❌ Tx rejected: bad nonce {} (expected {})", transaction.nonce, account.meta.current_nonce);
-                                continue;
-                            }
-                            // Build updates and then override account bytes with incremented nonce
-                            let (mut writes, mut mirrors) = build_link_account_updates(*account_addr, *chain, external_addr.clone(), *added_at_ms, block_tree, version);
-                            account.meta.current_nonce = account.meta.current_nonce.saturating_add(1);
-                            let acct_bytes = bcs::to_bytes(&account).unwrap();
-                            if let Some(pos) = writes.iter().position(|(k, _)| *k == acct_key) {
-                                writes[pos] = (acct_key, Some(acct_bytes.clone()));
-                            }
-                            // Replace mirror acct
-                            let acct_obj_key = crate::standards::accounts::make_account_object_key(account_addr);
-                            if let Some(mpos) = mirrors.iter().position(|(k, _)| *k == acct_obj_key) {
-                                mirrors[mpos] = (acct_obj_key, acct_bytes);
-                            }
-                            jmt_writes.extend(writes);
-                            app_mirror_inserts.extend(mirrors);
-                        } else {
-                            println!("❌ Tx rejected: failed to decode account");
-                        }
-                    } else {
-                        println!("❌ Tx rejected: account missing");
-                    }
+                PismoOperation::LinkAccount { account_addr, chain, added_at_ms } => {
+                    let (writes, mirrors) = build_link_account_updates(*account_addr, *chain, signing_pub_key.clone(), *added_at_ms, block_tree, version);
+                    jmt_writes.extend(writes);
+                    app_mirror_inserts.extend(mirrors);
                 }
             }
         }

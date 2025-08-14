@@ -4,15 +4,31 @@ pub mod onramp;
 pub mod accounts;
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use hotstuff_rs::types::crypto_primitives::{CryptoHasher, Digest};
 
 // Sui SDK imports for cryptographic operations
 use sui_sdk::types::{
     base_types::SuiAddress,
-    crypto::{SuiKeyPair, PublicKey},
+    crypto::SuiKeyPair,
 };
 
-use crate::utils::verify_signatures::verify_phantom_signature;
+use crate::utils::verify_signatures::{
+    build_signing_envelope,
+    verify_phantom_signature_bytes,
+    verify_ed25519_signature_with_public_key_hex,
+    compute_envelope_hash_bytes,
+};
+use crate::standards::accounts::{
+    Chain,
+    Account,
+    AccountAddr,
+    derive_account_addr,
+    get_account,
+};
+use crate::crypto::sui_keypair_to_hotstuff_signing_key;
+use hotstuff_rs::types::crypto_primitives::Signer as _;
+use hotstuff_rs::block_tree::accessors::app::AppBlockTreeView;
+use hotstuff_rs::block_tree::pluggables::KVStore;
+use crate::pismo_app_jmt::PismoOperation;
 
 #[derive(Clone, Copy, BorshSerialize, BorshDeserialize, Debug, serde::Serialize)]
 pub enum SignatureType {
@@ -62,66 +78,106 @@ where
 
     /// Create a transaction hash for signing
     pub fn create_hash(&self) -> anyhow::Result<Vec<u8>> {
-        let mut hasher = CryptoHasher::new();
-        hasher.update(&self.public_key.as_bytes());
-        hasher.update(&self.signer.as_bytes());
-        hasher.update(&self.payload.try_to_vec()?);
-        hasher.update(&self.nonce.to_le_bytes());
-        hasher.update(&self.chain_id.to_le_bytes());
-        let digest = hasher.finalize();
-        Ok(digest[..].to_vec())
+        // For envelope hashing used across frontends, use the same preimage as the frontend
+        let payload_bytes = self.payload.try_to_vec()?;
+        let digest = compute_envelope_hash_bytes(
+            &self.public_key,
+            &self.signer,
+            &payload_bytes,
+            self.nonce,
+            self.chain_id,
+        );
+        Ok(digest)
     }
 
     /// Sign the transaction with a Sui keypair and store the signature
     pub fn sign(&mut self, keypair: &SuiKeyPair) -> anyhow::Result<()> {
-        // Set public_key and signer from the keypair
+        // Set public_key (hex, no prefix) and signer as prefixed address
         self.public_key = hex::encode(keypair.public().as_ref());
         let address = SuiAddress::from(&keypair.public());
-        self.signer = address.to_string();
+        self.signer = format!("{}:{}", Chain::SuiDev.internal_prefix(), address.to_string());
         
-        // Create hash of transaction data
+        // Compute a deterministic hash of tx fields for integrity tracking (not used in signature)
         let hash = self.create_hash()?;
         self.hash = Some(hash.clone());
-        
-        // Create a Sui signature using the hash and keypair
-        let signature_data = format!("sui_sig_{}_{}", 
-                                    hex::encode(&hash), 
-                                    hex::encode(keypair.public().as_ref()));
-        self.signature = Some(signature_data.into_bytes());
+
+        // Build the shared envelope (same format used by Phantom)
+        let payload_bytes = self.payload.try_to_vec()?;
+        let envelope = build_signing_envelope(
+            &self.public_key,
+            &self.signer,
+            &payload_bytes,
+            self.nonce,
+            self.chain_id,
+        );
+
+        // Sign the envelope using the same underlying Ed25519 key material
+        let signing_key = sui_keypair_to_hotstuff_signing_key(keypair);
+        let signature = signing_key.sign(envelope.as_bytes());
+        self.signature = Some(signature.to_bytes().to_vec());
         self.signature_type = SignatureType::SuiDev;
         
         Ok(())
     }
 
-    /// Verify the transaction signature using Sui cryptographic verification
-    pub fn verify(&self, public_key: &PublicKey) -> anyhow::Result<bool> {
+    /// Verify the transaction with expected chain id and optional state (for nonce checks)
+    ///
+    /// - Always verifies signature and stored hash
+    /// - Enforces `self.chain_id == expected_chain_id`
+    /// - If state is provided, performs nonce checks per payload type
+    pub fn verify(&self, expected_chain_id: u16) -> anyhow::Result<bool> {
+        // Enforce chain id matches expectation
+        if self.chain_id != expected_chain_id {
+            return Ok(false);
+        }
+
         match self.signature_type {
             SignatureType::SuiDev => {
-                match (&self.signature, &self.hash) {
-                    (Some(sig_bytes), Some(hash)) => {
-                        if let Ok(sig_str) = String::from_utf8(sig_bytes.clone()) {
-                            if sig_str.starts_with("sui_sig_") {
-                                let expected_sig = format!("sui_sig_{}_{}", 
-                                                          hex::encode(hash), 
-                                                          hex::encode(public_key.as_ref()));
-                                let sig_valid = sig_str == expected_sig;
-                                let computed_hash = self.create_hash()?;
-                                let hash_valid = hash == &computed_hash;
-                                let expected_public_key = hex::encode(public_key.as_ref());
-                                let public_key_valid = self.public_key == expected_public_key;
-                                return Ok(sig_valid && hash_valid && public_key_valid);
-                            }
-                        }
-                        Ok(false)
+                match &self.signature {
+                    Some(sig_bytes) => {
+                        // Rebuild the envelope exactly as frontend and verify using Sui PersonalMessage intent digest
+                        let payload_bytes = self.payload.try_to_vec()?;
+                        let envelope = build_signing_envelope(
+                            &self.public_key,
+                            &self.signer,
+                            &payload_bytes,
+                            self.nonce,
+                            self.chain_id,
+                        );
+
+                        // Primary: Sui intent-digest verification
+                        let sig_valid_intent = verify_ed25519_signature_with_public_key_hex(
+                            &self.public_key,
+                            &envelope,
+                            sig_bytes,
+                        )?;
+
+                        // Also validate stored hash matches recomputed hash for integrity
+                        let hash_valid = match &self.hash {
+                            Some(stored) => stored == &self.create_hash()?,
+                            None => false,
+                        };
+
+                        Ok(sig_valid_intent && hash_valid)
                     }
-                    _ => Ok(false),
+                    None => Ok(false),
                 }
             }
             SignatureType::PhantomSolanaEd25519 => {
                 if let Some(sig_bytes) = &self.signature {
-                    if let Ok(sig_b64) = String::from_utf8(sig_bytes.clone()) {
-                        let msg_hex = hex::encode(self.create_hash()?);
-                        let verified = verify_phantom_signature(&self.signer, &msg_hex, &sig_b64)?;
+                    // Rebuild the exact envelope string before verification
+                    let payload_bytes = self.payload.try_to_vec()?;
+                    let envelope = build_signing_envelope(
+                        &self.public_key,
+                        &self.signer,
+                        &payload_bytes,
+                        self.nonce,
+                        self.chain_id,
+                    );
+
+                    // Prefer raw 64-byte signature if provided
+                    if sig_bytes.len() == 64 {
+                        let verified = verify_phantom_signature_bytes(&self.signer, &envelope, sig_bytes)?;
                         return Ok(verified);
                     }
                 }
@@ -130,8 +186,62 @@ where
         }
     }
 
+    /// Verify with state: provided for specific payloads via specialization below
+    /// (no default implementation for generic P)
+
     /// Check if transaction is properly signed
     pub fn is_signed(&self) -> bool {
-        self.signature.is_some() && self.hash.is_some() && !self.public_key.is_empty()
+        match self.signature_type {
+            SignatureType::SuiDev => {
+                self.signature.is_some()
+                    && self.hash.is_some()
+                    && self.signer.starts_with("sui:")
+            }
+            SignatureType::PhantomSolanaEd25519 => {
+                self.signature.is_some()
+                    && self.hash.is_some()
+                    && self.signer.starts_with("sol:")
+            }
+        }
+    }
+}
+
+impl Transaction<PismoOperation> {
+    /// Verify with state: performs all checks in `verify` plus nonce checks.
+    // This needs to be generalized. It can be basically the same thing every time.
+    pub fn verify_with_state<K: KVStore>(
+        &self,
+        expected_chain_id: u16,
+        block_tree: &AppBlockTreeView<'_, K>,
+        version: u64,
+    ) -> anyhow::Result<bool> {
+        // First, signature/hash + chain id check
+        if !self.verify(expected_chain_id)? {
+            return Ok(false);
+        }
+
+        // Nonce checks per payload type
+        let nonce_ok = match &self.payload {
+            // For create, account must not yet exist and nonce must be 0
+            PismoOperation::CreateAccount { chain, .. } => {
+                let derived_addr: AccountAddr = derive_account_addr(1, *chain, &self.public_key);
+                let existing: Option<Account> = get_account(block_tree, version.saturating_sub(1), &derived_addr);
+                existing.is_none() && self.nonce == 0
+            }
+            // For link, the account must exist and tx.nonce must equal current_nonce
+            PismoOperation::LinkAccount { account_addr, .. } => {
+                if let Some(account) = get_account(block_tree, version.saturating_sub(1), account_addr) {
+                    self.nonce == account.current_nonce
+                } else {
+                    false
+                }
+            }
+            // For onramp, enforce nonce == 0 for now (no account context)
+            PismoOperation::Onramp(_, _) => {
+                self.nonce == 0
+            }
+        };
+
+        Ok(nonce_ok)
     }
 }
