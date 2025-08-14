@@ -32,8 +32,9 @@ use crate::config::Config;
 use crate::jmt_state::{make_state_key, make_key_hash_from_parts, get_jmt_root, get_jmt_value, compute_jmt_updates, get_with_proof};
 use hotstuff_rs::block_tree::pluggables::KVStore;
 use jmt::{KeyHash, RootHash, OwnedValue, proof::SparseMerkleProof};
-use crate::standards::accounts::{Chain, AccountAddr};
+
 use crate::transactions::accounts::{build_create_account_updates, build_link_account_updates};
+use crate::transactions::noop::build_noop_updates;
  
 
 /// Counter-specific transaction operations that can be performed
@@ -43,15 +44,15 @@ pub enum PismoOperation {
     Onramp(String, u64), // vaa string, guardian_set index
     /// Create a new account from an external wallet link
     CreateAccount {
-        chain: Chain,
         created_at_ms: u64,
     },
     /// Link a new external wallet to an existing account
     LinkAccount {
-        account_addr: AccountAddr,
-        chain: Chain,
+        external_wallet: String,
         added_at_ms: u64,
     },
+    /// No-operation transaction that only increments the account nonce
+    NoOp,
 }
 
 /// Type alias for counter transactions
@@ -351,6 +352,23 @@ impl PismoAppJMT {
             }
 
             let signing_pub_key = transaction.public_key.clone();
+            let signer_type = transaction.signer_type;
+            let signer_address = &transaction.signer;
+            let signature_type = transaction.signature_type;
+
+            // Skip non-CreateAccount transactions with NewAccount signer type
+            match (&transaction.payload, signer_type) {
+                (PismoOperation::CreateAccount { .. }, _) => {
+                    // CreateAccount is allowed with any signer type
+                }
+                (_, crate::transactions::SignerType::NewAccount) => {
+                    println!("❌ Skipping non-CreateAccount transaction with NewAccount signer type");
+                    continue;
+                }
+                _ => {
+                    // Other combinations are allowed
+                }
+            }
 
             match &transaction.payload {
                 // Remove counter-only transactions per new requirements
@@ -371,13 +389,18 @@ impl PismoAppJMT {
                         }
                     }
                 }
-                PismoOperation::CreateAccount { chain, created_at_ms } => {
-                    let (writes, mirrors) = build_create_account_updates(*chain, signing_pub_key.clone(), *created_at_ms, block_tree, version);
+                PismoOperation::CreateAccount { created_at_ms } => {
+                    let (writes, mirrors) = build_create_account_updates(signature_type, signing_pub_key.clone(), *created_at_ms, signer_type, block_tree, version);
                     jmt_writes.extend(writes);
                     app_mirror_inserts.extend(mirrors);
                 }
-                PismoOperation::LinkAccount { account_addr, chain, added_at_ms } => {
-                    let (writes, mirrors) = build_link_account_updates(*account_addr, *chain, signing_pub_key.clone(), *added_at_ms, block_tree, version);
+                PismoOperation::LinkAccount { external_wallet, added_at_ms } => {
+                    let (writes, mirrors) = build_link_account_updates(signing_pub_key.clone(), external_wallet, signature_type, signer_address, signer_type, *added_at_ms, block_tree, version);
+                    jmt_writes.extend(writes);
+                    app_mirror_inserts.extend(mirrors);
+                }
+                PismoOperation::NoOp => {
+                    let (writes, mirrors) = build_noop_updates(signing_pub_key.clone(), signer_address, signer_type, signature_type, block_tree, version);
                     jmt_writes.extend(writes);
                     app_mirror_inserts.extend(mirrors);
                 }

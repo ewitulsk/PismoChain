@@ -5,7 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use sha3::{Digest, Sha3_256};
 use hotstuff_rs::block_tree::accessors::app::AppBlockTreeView;
 use hotstuff_rs::block_tree::pluggables::KVStore;
-use crate::jmt_state::{get_jmt_value, make_key_hash_from_parts};
+
+use crate::transactions::{SignerType, SignatureType};
 
 pub type Bytes = Vec<u8>;
 pub type AccountAddr = [u8; 32];
@@ -21,35 +22,25 @@ pub enum KeyAlgo {
     Sr25519 = 2,
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize, BorshSerialize, BorshDeserialize, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub enum Chain {
-    EthereumSecp256k1,
-    SolanaEd25519,
-    SuiDev,
-}
-
-impl Chain {
+impl SignatureType {
     pub const fn internal_id(self) -> u16 {
         match self {
-            Chain::EthereumSecp256k1 => 1,
-            Chain::SolanaEd25519 => 2,
-            Chain::SuiDev => 3,
+            SignatureType::PhantomSolanaEd25519 => 2,
+            SignatureType::SuiDev => 3,
         }
     }
 
-    //This should probably be removed
     pub const fn internal_prefix(self) -> &'static str {
         match self {
-            Chain::EthereumSecp256k1 => "eth",
-            Chain::SolanaEd25519 => "sol",
-            Chain::SuiDev => "sui",
+            SignatureType::PhantomSolanaEd25519 => "sol",
+            SignatureType::SuiDev => "sui",
         }
     }
 }
 
 #[derive(Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct ExternalLink {
-    pub chain: Chain,
+    pub signature_type: SignatureType,
     pub address: String,
     pub algo: KeyAlgo,
     pub added_at: UnixMillis,
@@ -68,7 +59,7 @@ bitflags::bitflags! {
 
 #[derive(Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug)]
 pub enum SessionIssuer {
-    LinkedKey { chain: Chain, address: String },
+    LinkedKey { signature_type: SignatureType, address: String },
     SessionKey { pubkey: PubKey },
 }
 
@@ -116,12 +107,12 @@ impl Account {
     }
 }
 
-pub fn derive_account_addr(version: u8, chain: Chain, external_addr_str: &str) -> AccountAddr {
+pub fn derive_account_addr(version: u8, signature_type: SignatureType, external_addr_str: &str) -> AccountAddr {
     let external_addr_bytes = external_addr_str.as_bytes();
     let mut hasher = Sha3_256::new();
     hasher.update(b"acct");
     hasher.update([version]);
-    hasher.update(chain.internal_id().to_le_bytes());
+    hasher.update(signature_type.internal_id().to_le_bytes());
     hasher.update(external_addr_bytes);
     let digest = hasher.finalize();
     let mut out = [0u8; 32];
@@ -135,20 +126,19 @@ pub fn make_account_object_key(account_addr: &AccountAddr) -> Vec<u8> {
     k
 }
 
-pub fn make_link_object_key(chain: Chain, external_addr_str: &str) -> Vec<u8> {
+pub fn make_link_object_key(signature_type: SignatureType, external_addr_str: &str) -> Vec<u8> {
     let external_addr_bytes = external_addr_str.as_bytes();
     let mut k = b"link/".to_vec();
-    k.extend_from_slice(&chain.internal_id().to_le_bytes());
+    k.extend_from_slice(&signature_type.internal_id().to_le_bytes());
     k.push(b'/');
     k.extend_from_slice(external_addr_bytes);
     k
 }
 
-pub fn default_algo_for_chain(chain: Chain) -> KeyAlgo {
-    match chain {
-        Chain::EthereumSecp256k1 => KeyAlgo::Secp256k1,
-        Chain::SolanaEd25519 => KeyAlgo::Ed25519,
-        Chain::SuiDev => KeyAlgo::Ed25519,
+pub fn default_algo_for_signature_type(signature_type: SignatureType) -> KeyAlgo {
+    match signature_type {
+        SignatureType::PhantomSolanaEd25519 => KeyAlgo::Ed25519,
+        SignatureType::SuiDev => KeyAlgo::Ed25519,
     }
 }
 
@@ -170,27 +160,76 @@ impl borsh::BorshDeserialize for ScopeBits {
 /// Fetch an `Account` by `account_addr` from committed state, using mirror first then JMT fallback.
 pub fn get_account<K: KVStore>(
     block_tree: &AppBlockTreeView<'_, K>,
-    version: u64,
-    account_addr: &AccountAddr,
+    address: &AccountAddr,
     ) -> Option<Account> {
     // Try app-level mirror object first
-    let mirror_key = make_account_object_key(account_addr);
+    let mirror_key = make_account_object_key(address);
     if let Some(bytes) = block_tree.app_state(&mirror_key) {
         if let Ok(account) = <Account as borsh::BorshDeserialize>::try_from_slice(&bytes) {
             return Some(account);
         }
     }
 
-    // Fallback to JMT-stored value
-    let jmt_key = make_key_hash_from_parts(*account_addr, b"acct");
-    if let Ok(maybe_bytes) = get_jmt_value(block_tree, jmt_key, version) {
-        if let Some(bytes) = maybe_bytes {
-            if let Ok(account) = <Account as borsh::BorshDeserialize>::try_from_slice(&bytes) {
-                return Some(account);
-            }
+    None
+}
+
+/// Fetch an `ExternalLink` by signature_type and address from committed state
+pub fn get_link_object<K: KVStore>(
+    block_tree: &AppBlockTreeView<'_, K>,
+    signature_type: SignatureType,
+    address: &str,
+) -> Option<ExternalLink> {
+    let link_key = make_link_object_key(signature_type, address);
+    if let Some(bytes) = block_tree.app_state(&link_key) {
+        if let Ok(link) = <ExternalLink as borsh::BorshDeserialize>::try_from_slice(&bytes) {
+            return Some(link);
         }
     }
-
     None
+}
+
+/// Derive a link address from a signer address by extracting the address part
+/// Expects signer_address format: "signature_type_prefix:actual_address"
+pub fn derive_link_address(signer_address: &str, signature_type: SignatureType) -> Option<String> {
+    let prefix = signature_type.internal_prefix();
+    let expected_prefix = format!("{}:", prefix);
+    
+    if signer_address.starts_with(&expected_prefix) {
+        Some(signer_address[expected_prefix.len()..].to_string())
+    } else {
+        None
+    }
+}
+
+/// Fetch an `Account` from a signer address based on signer type
+pub fn get_account_from_signer<K: KVStore>(
+    block_tree: &AppBlockTreeView<'_, K>,
+    signer_address: &String,
+    signer_type: SignerType,
+    signature_type: SignatureType,
+    _signing_pub_key: &str,
+) -> Option<Account> {
+    match signer_type {
+        SignerType::NewAccount => {
+            None
+        }
+        SignerType::Linked => {
+            // Extract the actual address from the signer address and get the link object
+            if let Some(link_address) = derive_link_address(signer_address, signature_type) {
+                if let Some(_link) = get_link_object(block_tree, signature_type, &link_address) {
+                    let account_addr = derive_account_addr(1, signature_type, &link_address);
+                    get_account(block_tree, &account_addr)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        SignerType::Temp => {
+            // Return None for temporary signers as requested
+            None
+        }
+    }
 }
 

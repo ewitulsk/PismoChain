@@ -2,6 +2,7 @@
 
 pub mod onramp;
 pub mod accounts;
+pub mod noop;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 
@@ -18,11 +19,11 @@ use crate::utils::verify_signatures::{
     compute_envelope_hash_bytes,
 };
 use crate::standards::accounts::{
-    Chain,
     Account,
     AccountAddr,
     derive_account_addr,
     get_account,
+    get_account_from_signer,
 };
 use crate::crypto::sui_keypair_to_hotstuff_signing_key;
 use hotstuff_rs::types::crypto_primitives::Signer as _;
@@ -30,10 +31,17 @@ use hotstuff_rs::block_tree::accessors::app::AppBlockTreeView;
 use hotstuff_rs::block_tree::pluggables::KVStore;
 use crate::pismo_app_jmt::PismoOperation;
 
-#[derive(Clone, Copy, BorshSerialize, BorshDeserialize, Debug, serde::Serialize)]
+#[derive(Clone, Copy, BorshSerialize, BorshDeserialize, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SignatureType {
     SuiDev,
     PhantomSolanaEd25519,
+}
+
+#[derive(Clone, Copy, BorshSerialize, BorshDeserialize, Debug, serde::Serialize)]
+pub enum SignerType {
+    NewAccount,
+    Linked,
+    Temp,
 }
 
 /// Generic transaction structure that wraps any payload with sender/signer information
@@ -56,6 +64,8 @@ pub struct Transaction<P> {
     pub chain_id: u16,
     /// What scheme to use when verifying the signature
     pub signature_type: SignatureType,
+    /// Type of signer (new account, linked account, or temporary)
+    pub signer_type: SignerType,
 }
 
 impl<P> Transaction<P> 
@@ -73,6 +83,7 @@ where
             nonce,
             chain_id,
             signature_type: SignatureType::SuiDev,
+            signer_type: SignerType::NewAccount, // Default to NewAccount
         }
     }
 
@@ -95,7 +106,7 @@ where
         // Set public_key (hex, no prefix) and signer as prefixed address
         self.public_key = hex::encode(keypair.public().as_ref());
         let address = SuiAddress::from(&keypair.public());
-        self.signer = format!("{}:{}", Chain::SuiDev.internal_prefix(), address.to_string());
+        self.signer = format!("{}:{}", SignatureType::SuiDev.internal_prefix(), address.to_string());
         
         // Compute a deterministic hash of tx fields for integrity tracking (not used in signature)
         let hash = self.create_hash()?;
@@ -213,7 +224,7 @@ impl Transaction<PismoOperation> {
         &self,
         expected_chain_id: u16,
         block_tree: &AppBlockTreeView<'_, K>,
-        version: u64,
+        _version: u64,
     ) -> anyhow::Result<bool> {
         // First, signature/hash + chain id check
         if !self.verify(expected_chain_id)? {
@@ -223,14 +234,14 @@ impl Transaction<PismoOperation> {
         // Nonce checks per payload type
         let nonce_ok = match &self.payload {
             // For create, account must not yet exist and nonce must be 0
-            PismoOperation::CreateAccount { chain, .. } => {
-                let derived_addr: AccountAddr = derive_account_addr(1, *chain, &self.public_key);
-                let existing: Option<Account> = get_account(block_tree, version.saturating_sub(1), &derived_addr);
+            PismoOperation::CreateAccount { .. } => {
+                let derived_addr: AccountAddr = derive_account_addr(1, self.signature_type, &self.public_key);
+                let existing: Option<Account> = get_account(block_tree, &derived_addr);
                 existing.is_none() && self.nonce == 0
             }
             // For link, the account must exist and tx.nonce must equal current_nonce
-            PismoOperation::LinkAccount { account_addr, .. } => {
-                if let Some(account) = get_account(block_tree, version.saturating_sub(1), account_addr) {
+            PismoOperation::LinkAccount { .. } => {
+                if let Some(account) = get_account_from_signer(block_tree, &self.signer, self.signer_type, self.signature_type, &self.public_key) {
                     self.nonce == account.current_nonce
                 } else {
                     false
@@ -239,6 +250,15 @@ impl Transaction<PismoOperation> {
             // For onramp, enforce nonce == 0 for now (no account context)
             PismoOperation::Onramp(_, _) => {
                 self.nonce == 0
+            }
+            // For NoOp, the account must exist and tx.nonce must equal current_nonce
+            PismoOperation::NoOp => {
+                // if let Some(account) = get_account(block_tree, version.saturating_sub(1), account_addr) {
+                //     self.nonce == account.current_nonce
+                // } else {
+                //     false
+                // }
+                false
             }
         };
 
