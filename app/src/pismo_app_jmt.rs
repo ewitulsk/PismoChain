@@ -35,6 +35,7 @@ use jmt::{KeyHash, RootHash, OwnedValue, proof::SparseMerkleProof};
 
 use crate::transactions::accounts::{build_create_account_updates, build_link_account_updates};
 use crate::transactions::noop::build_noop_updates;
+use crate::transactions::coin::{build_new_coin_updates, build_mint_updates};
  
 
 /// Counter-specific transaction operations that can be performed
@@ -53,6 +54,21 @@ pub enum PismoOperation {
     },
     /// No-operation transaction that only increments the account nonce
     NoOp,
+    /// Create a new token
+    NewCoin {
+        name: String,
+        project_uri: String,
+        logo_uri: String,
+        total_supply: u128,
+        max_supply: Option<u128>,
+        canonical_chain_id: u64,
+    },
+    /// Mint tokens to an account's coin store
+    Mint {
+        coin_addr: [u8; 32],
+        account_addr: [u8; 32],
+        amount: u128,
+    },
 }
 
 /// Type alias for counter transactions
@@ -401,6 +417,39 @@ impl PismoAppJMT {
                 }
                 PismoOperation::NoOp => {
                     let (writes, mirrors) = build_noop_updates(signing_pub_key.clone(), signer_address, signer_type, signature_type, block_tree, version);
+                    jmt_writes.extend(writes);
+                    app_mirror_inserts.extend(mirrors);
+                }
+                PismoOperation::NewCoin { name, project_uri, logo_uri, total_supply, max_supply, canonical_chain_id } => {
+                    let (writes, mirrors) = build_new_coin_updates(
+                        name.clone(),
+                        project_uri.clone(),
+                        logo_uri.clone(),
+                        *total_supply,
+                        *max_supply,
+                        *canonical_chain_id,
+                        signing_pub_key.clone(),
+                        signer_address,
+                        signer_type,
+                        signature_type,
+                        block_tree,
+                        version
+                    );
+                    jmt_writes.extend(writes);
+                    app_mirror_inserts.extend(mirrors);
+                }
+                PismoOperation::Mint { coin_addr, account_addr, amount } => {
+                    let (writes, mirrors) = build_mint_updates(
+                        *coin_addr,
+                        *account_addr,
+                        *amount,
+                        signing_pub_key.clone(),
+                        signer_address,
+                        signer_type,
+                        signature_type,
+                        block_tree,
+                        version
+                    );
                     jmt_writes.extend(writes);
                     app_mirror_inserts.extend(mirrors);
                 }

@@ -3,6 +3,7 @@
 pub mod onramp;
 pub mod accounts;
 pub mod noop;
+pub mod coin;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 
@@ -72,21 +73,6 @@ impl<P> Transaction<P>
 where 
     P: BorshSerialize + BorshDeserialize + Clone,
 {
-    /// Create a new unsigned transaction
-    pub fn new(payload: P, nonce: u64, chain_id: u16) -> Self {
-        Self {
-            public_key: String::new(), // Will be set when signing
-            signer: String::new(), // Will be set when signing
-            payload,
-            signature: None,
-            hash: None,
-            nonce,
-            chain_id,
-            signature_type: SignatureType::SuiDev,
-            signer_type: SignerType::NewAccount, // Default to NewAccount
-        }
-    }
-
     /// Create a transaction hash for signing
     pub fn create_hash(&self) -> anyhow::Result<Vec<u8>> {
         // For envelope hashing used across frontends, use the same preimage as the frontend
@@ -99,36 +85,6 @@ where
             self.chain_id,
         );
         Ok(digest)
-    }
-
-    /// Sign the transaction with a Sui keypair and store the signature
-    pub fn sign(&mut self, keypair: &SuiKeyPair) -> anyhow::Result<()> {
-        // Set public_key (hex, no prefix) and signer as prefixed address
-        self.public_key = hex::encode(keypair.public().as_ref());
-        let address = SuiAddress::from(&keypair.public());
-        self.signer = format!("{}:{}", SignatureType::SuiDev.internal_prefix(), address.to_string());
-        
-        // Compute a deterministic hash of tx fields for integrity tracking (not used in signature)
-        let hash = self.create_hash()?;
-        self.hash = Some(hash.clone());
-
-        // Build the shared envelope (same format used by Phantom)
-        let payload_bytes = self.payload.try_to_vec()?;
-        let envelope = build_signing_envelope(
-            &self.public_key,
-            &self.signer,
-            &payload_bytes,
-            self.nonce,
-            self.chain_id,
-        );
-
-        // Sign the envelope using the same underlying Ed25519 key material
-        let signing_key = sui_keypair_to_hotstuff_signing_key(keypair);
-        let signature = signing_key.sign(envelope.as_bytes());
-        self.signature = Some(signature.to_bytes().to_vec());
-        self.signature_type = SignatureType::SuiDev;
-        
-        Ok(())
     }
 
     /// Verify the transaction with expected chain id and optional state (for nonce checks)
@@ -242,7 +198,7 @@ impl Transaction<PismoOperation> {
             // For link, the account must exist and tx.nonce must equal current_nonce
             PismoOperation::LinkAccount { .. } => {
                 if let Some(account) = get_account_from_signer(block_tree, &self.signer, self.signer_type, self.signature_type, &self.public_key) {
-                    self.nonce == account.current_nonce
+                    self.nonce == account.current_nonce //This seems like a sus way of incrementing the nonce...
                 } else {
                     false
                 }
@@ -259,6 +215,22 @@ impl Transaction<PismoOperation> {
                 //     false
                 // }
                 false
+            }
+            // For NewCoin, the account must exist and tx.nonce must equal current_nonce
+            PismoOperation::NewCoin { .. } => {
+                if let Some(account) = get_account_from_signer(block_tree, &self.signer, self.signer_type, self.signature_type, &self.public_key) {
+                    self.nonce == account.current_nonce
+                } else {
+                    false
+                }
+            }
+            // For Mint, the account must exist and tx.nonce must equal current_nonce
+            PismoOperation::Mint { .. } => {
+                if let Some(account) = get_account_from_signer(block_tree, &self.signer, self.signer_type, self.signature_type, &self.public_key) {
+                    self.nonce == account.current_nonce
+                } else {
+                    false
+                }
             }
         };
 
