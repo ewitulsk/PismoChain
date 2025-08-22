@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use sha3::{Digest, Sha3_256};
 use hotstuff_rs::block_tree::accessors::app::AppBlockTreeView;
 use hotstuff_rs::block_tree::pluggables::KVStore;
+use jmt::KeyHash;
 
 use crate::transactions::{SignerType, SignatureType};
 
@@ -30,18 +31,13 @@ impl SignatureType {
         }
     }
 
-    pub const fn internal_prefix(self) -> &'static str {
-        match self {
-            SignatureType::PhantomSolanaEd25519 => "sol",
-            SignatureType::SuiDev => "sui",
-        }
-    }
+
 }
 
 #[derive(Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct ExternalLink {
     pub signature_type: SignatureType,
-    pub address: String,
+    pub account_addr: AccountAddr, // The account address this external link points to
     pub algo: KeyAlgo,
     pub added_at: UnixMillis,
 }
@@ -135,6 +131,34 @@ pub fn make_link_object_key(signature_type: SignatureType, external_addr_str: &s
     k
 }
 
+/// Create a JMT KeyHash for a link object based on signature type and external address
+pub fn make_link_jmt_key_hash(signature_type: SignatureType, external_addr_str: &str) -> KeyHash {
+    // Create a state key similar to make_link_object_key but for JMT
+    let external_addr_bytes = external_addr_str.as_bytes();
+    let sig_type_bytes = signature_type.internal_id().to_le_bytes();
+    
+    // Create a composite address: signature_type_id + "/" + external_address
+    let mut combined = Vec::new();
+    combined.extend_from_slice(&sig_type_bytes);
+    combined.push(b'/');
+    combined.extend_from_slice(external_addr_bytes);
+    
+    // Pad or truncate to 32 bytes for consistent address format
+    let mut address = [0u8; 32];
+    if combined.len() <= 32 {
+        address[..combined.len()].copy_from_slice(&combined);
+    } else {
+        // Hash if too long
+        let mut hasher = Sha3_256::new();
+        hasher.update(&combined);
+        let digest = hasher.finalize();
+        address.copy_from_slice(&digest[..32]);
+    }
+    
+    // Use "link" as the struct tag
+    crate::jmt_state::make_key_hash_from_parts(address, b"link")
+}
+
 pub fn default_algo_for_signature_type(signature_type: SignatureType) -> KeyAlgo {
     match signature_type {
         SignatureType::PhantomSolanaEd25519 => KeyAlgo::Ed25519,
@@ -188,46 +212,28 @@ pub fn get_link_object<K: KVStore>(
     None
 }
 
-/// Derive a link address from a signer address by extracting the address part
-/// Expects signer_address format: "signature_type_prefix:actual_address"
-pub fn derive_link_address(signer_address: &str, signature_type: SignatureType) -> Option<String> {
-    let prefix = signature_type.internal_prefix();
-    let expected_prefix = format!("{}:", prefix);
-    
-    if signer_address.starts_with(&expected_prefix) {
-        Some(signer_address[expected_prefix.len()..].to_string())
-    } else {
-        None
-    }
-}
+
 
 /// Fetch an `Account` from a signer address based on signer type
 pub fn get_account_from_signer<K: KVStore>(
     block_tree: &AppBlockTreeView<'_, K>,
-    signer_address: &String,
+    _signer_address: &String,
     signer_type: SignerType,
     signature_type: SignatureType,
-    _signing_pub_key: &str,
+    signing_pub_key: &str,
 ) -> Option<Account> {
     match signer_type {
         SignerType::NewAccount => {
             None
         }
         SignerType::Linked => {
-            // Extract the actual address from the signer address and get the link object
-            if let Some(link_address) = derive_link_address(signer_address, signature_type) {
-                if let Some(_link) = get_link_object(block_tree, signature_type, &link_address) {
-                    let account_addr = derive_account_addr(1, signature_type, &link_address);
-                    get_account(block_tree, &account_addr)
-                } else {
-                    None
-                }
+            if let Some(link) = get_link_object(block_tree, signature_type, signing_pub_key) {
+                get_account(block_tree, &link.account_addr)
             } else {
                 None
             }
         }
         SignerType::Temp => {
-            // Return None for temporary signers as requested
             None
         }
     }

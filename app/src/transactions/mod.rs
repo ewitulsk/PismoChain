@@ -187,6 +187,8 @@ impl Transaction<PismoOperation> {
             return Ok(false);
         }
 
+        println!("Passed initial verify_with_state verification");
+
         // Nonce checks per payload type
         let nonce_ok = match &self.payload {
             // For create, account must not yet exist and nonce must be 0
@@ -218,7 +220,9 @@ impl Transaction<PismoOperation> {
             }
             // For NewCoin, the account must exist and tx.nonce must equal current_nonce
             PismoOperation::NewCoin { .. } => {
+                println!("Verifying new coin...");
                 if let Some(account) = get_account_from_signer(block_tree, &self.signer, self.signer_type, self.signature_type, &self.public_key) {
+                    println!("self.nonce: {:?}, account.current_nonce: {:?}, self.nonce == account.current_nonce: {:?}", self.nonce, account.current_nonce, self.nonce == account.current_nonce);
                     self.nonce == account.current_nonce
                 } else {
                     false

@@ -43,6 +43,7 @@ const JMT_VALUE_PREFIX: &[u8] = b"__jmt_value__";
 const JMT_ROOT_PREFIX: &[u8] = b"__jmt_root__";
 /// Prefix for the secondary "latest" index
 const JMT_LATEST_PREFIX: &[u8] = b"__jmt_latest__";
+const COMMITTED_APP_STATE: u8 = 3;
 
 /// Helper to create a latest-value index key for a given KeyHash
 fn make_latest_key(key_hash: KeyHash) -> Vec<u8> {
@@ -192,6 +193,58 @@ pub fn compute_jmt_updates<K: KVStore>(
     updates.insert(root_key, new_root.0.to_vec());
 
     Ok((new_root, updates))
+}
+
+/// Simple JMT reader that works directly with KVStore for RPC queries
+pub struct DirectJMTReader<'a, K: KVStore> {
+    kv_store: &'a K,
+}
+
+impl<'a, K: KVStore> DirectJMTReader<'a, K> {
+    pub fn new(kv_store: &'a K) -> Self {
+        Self { kv_store }
+    }
+}
+
+impl<'a, K: KVStore> TreeReader for DirectJMTReader<'a, K> {
+    fn get_node_option(&self, node_key: &NodeKey) -> Result<Option<Node>> {
+        let mut key = Vec::new();
+        key.push(COMMITTED_APP_STATE);
+        key.extend_from_slice(JMT_NODE_PREFIX);
+        key.extend_from_slice(&bincode::serialize(node_key)?);
+        
+        Ok(self.kv_store.get(&key)
+            .map(|bytes| bincode::deserialize(&bytes))
+            .transpose()?)
+    }
+
+    fn get_value_option(&self, max_version: Version, key_hash: KeyHash) -> Result<Option<OwnedValue>> {
+        // Check the latest version index for this key
+        let mut latest_key = Vec::new();
+        latest_key.push(COMMITTED_APP_STATE); 
+        latest_key.extend_from_slice(JMT_LATEST_PREFIX);
+        latest_key.extend_from_slice(&key_hash.0);
+        
+        if let Some(vbytes) = self.kv_store.get(&latest_key) {
+            if vbytes.len() >= 8 {
+                let latest = Version::from_le_bytes(vbytes[..8].try_into()?);
+                
+                if latest <= max_version {
+                    let mut value_key = Vec::new();
+                    value_key.push(COMMITTED_APP_STATE);
+                    value_key.extend_from_slice(JMT_VALUE_PREFIX);
+                    value_key.extend_from_slice(&latest.to_le_bytes());
+                    value_key.extend_from_slice(&key_hash.0);
+                    return Ok(self.kv_store.get(&value_key));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn get_rightmost_leaf(&self) -> Result<Option<(NodeKey, LeafNode)>> {
+        Ok(None) // Not needed for simple queries
+    }
 }
 
 /// Get a value with cryptographic proof from committed app state

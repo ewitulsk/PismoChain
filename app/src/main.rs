@@ -16,9 +16,10 @@ use utils::{
     submit_transactions::submit_transaction,
 };
 use standards::{
-    accounts::Account,
+    accounts::{Account, ExternalLink, make_link_jmt_key_hash},
     coin::{Coin, CoinStore},
 };
+use transactions::SignatureType;
 use database::mem_db::MemDB;
 use pismo_app_jmt::PismoAppJMT;
 use pismo_app_jmt::PismoTransaction;
@@ -49,8 +50,8 @@ use std::{
     collections::HashMap,
 };
 
-use crate::jmt_state::make_key_hash_from_parts;
-use jmt::{JellyfishMerkleTree, storage::TreeReader, KeyHash, Version, OwnedValue, storage::{Node, NodeKey, LeafNode}};
+use crate::jmt_state::{make_key_hash_from_parts, DirectJMTReader};
+use jmt::JellyfishMerkleTree;
 
  
 
@@ -254,57 +255,10 @@ async fn main() {
         .register_method("view", move |params, _mdata, _ctx| {
             use jsonrpsee::types::ErrorObjectOwned;
             use serde_json::Value;
-            use hotstuff_rs::block_tree::pluggables::KVStore;
 
-            // Simple JMT reader that works directly with KVStore for RPC queries
-            struct DirectJMTReader<'a, K: KVStore> {
-                kv_store: &'a K,
-            }
 
-            impl<'a, K: KVStore> TreeReader for DirectJMTReader<'a, K> {
-                fn get_node_option(&self, node_key: &NodeKey) -> anyhow::Result<Option<Node>> {
-                    let mut key = Vec::new();
-                    key.push(3); // COMMITTED_APP_STATE prefix from HotStuff
-                    key.extend_from_slice(b"__jmt_node__");
-                    key.extend_from_slice(&bincode::serialize(node_key)?);
-                    
-                    Ok(self.kv_store.get(&key)
-                        .map(|bytes| bincode::deserialize(&bytes))
-                        .transpose()?)
-                }
 
-                fn get_value_option(&self, max_version: Version, key_hash: KeyHash) -> anyhow::Result<Option<OwnedValue>> {
-                    println!("Getting latest value");
-                    
-                    // Check the latest version index for this key
-                    let mut latest_key = Vec::new();
-                    latest_key.push(3); // COMMITTED_APP_STATE prefix from HotStuff
-                    latest_key.extend_from_slice(b"__jmt_latest__");
-                    latest_key.extend_from_slice(&key_hash.0);
-                    
-                    if let Some(vbytes) = self.kv_store.get(&latest_key) {
-                        if vbytes.len() >= 8 {
-                            let latest = Version::from_le_bytes(vbytes[..8].try_into()?);
-                            
-                            if latest <= max_version {
-                                let mut value_key = Vec::new();
-                                value_key.push(3); // COMMITTED_APP_STATE prefix from HotStuff
-                                value_key.extend_from_slice(b"__jmt_value__");
-                                value_key.extend_from_slice(&latest.to_le_bytes());
-                                value_key.extend_from_slice(&key_hash.0);
-                                return Ok(self.kv_store.get(&value_key));
-                            }
-                        }
-                    }
-                    Ok(None)
-                }
-
-                fn get_rightmost_leaf(&self) -> anyhow::Result<Option<(NodeKey, LeafNode)>> {
-                    Ok(None) // Not needed for simple queries
-                }
-            }
-
-            // Parse parameters: {"address": "hex_string", "type": "Account|Coin|CoinStore"}
+            // Parse parameters: {"address": "hex_string", "type": "Account|Coin|CoinStore|Link", "signature_type"?: number, "external_address"?: string}
             let params_obj: Value = params.parse()?;
             
             let address_hex = params_obj.get("address")
@@ -315,20 +269,25 @@ async fn main() {
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| ErrorObjectOwned::owned(-32602, "Missing 'type' parameter", None::<String>))?;
 
-            // Decode hex address to bytes
-            let address_bytes = hex::decode(address_hex).map_err(|e| {
-                ErrorObjectOwned::owned(-32602, "Invalid hex address", Some(e.to_string()))
-            })?;
+            // For Link queries, we don't need to validate the address as 32 bytes since we use external_address
+            let address: [u8; 32] = if struct_type == "Link" {
+                // For Link queries, the address parameter is not used, so we can use a dummy value
+                [0u8; 32]
+            } else {
+                // For other query types, decode and validate the hex address
+                let address_bytes = hex::decode(address_hex).map_err(|e| {
+                    ErrorObjectOwned::owned(-32602, "Invalid hex address", Some(e.to_string()))
+                })?;
 
-            if address_bytes.len() != 32 {
-                return Err(ErrorObjectOwned::owned(-32602, "Address must be 32 bytes", None::<String>));
-            }
+                if address_bytes.len() != 32 {
+                    return Err(ErrorObjectOwned::owned(-32602, "Address must be 32 bytes", None::<String>));
+                }
 
-            let address: [u8; 32] = address_bytes.try_into().unwrap();
-            println!("View looking for address: {:?}", address);
+                address_bytes.try_into().unwrap()
+            };
 
             // Create JMT reader and tree directly with KVStore
-            let reader = DirectJMTReader { kv_store: &kv_store_for_view };
+            let reader = DirectJMTReader::new(&kv_store_for_view);
             let tree = JellyfishMerkleTree::<_, sha2::Sha256>::new(&reader);
             
             // Use u64::MAX as version to get the latest committed value
@@ -339,9 +298,7 @@ async fn main() {
                 "Account" => {
                     // Create JMT key hash for account
                     let key_hash = make_key_hash_from_parts(address, b"acct");
-                    
-                    println!("Looking for account with key_hash: {:?}", key_hash);
-                    
+                                        
                     match tree.get(key_hash, version) {
                         Ok(Some(bytes)) => {
                             match <Account as borsh::BorshDeserialize>::try_from_slice(&bytes) {
@@ -389,8 +346,41 @@ async fn main() {
                         Err(e) => return Err(ErrorObjectOwned::owned(-32001, "Failed to query JMT", Some(e.to_string()))),
                     }
                 }
+                "Link" => {
+                    // For Link queries, we need signature_type and external_address parameters
+                    let signature_type_num = params_obj.get("signature_type")
+                        .and_then(|v| v.as_u64())
+                        .ok_or_else(|| ErrorObjectOwned::owned(-32602, "Missing 'signature_type' parameter for Link query", None::<String>))?;
+                    
+                    let external_address = params_obj.get("external_address")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| ErrorObjectOwned::owned(-32602, "Missing 'external_address' parameter for Link query", None::<String>))?;
+                    
+                    // Convert signature_type number to enum
+                    let signature_type = match signature_type_num {
+                        0 => SignatureType::SuiDev,
+                        1 => SignatureType::PhantomSolanaEd25519,
+                        _ => return Err(ErrorObjectOwned::owned(-32602, "Invalid signature_type. Use 0 for SuiDev, 1 for PhantomSolanaEd25519", None::<String>)),
+                    };
+                    
+                    // Create JMT key hash for link using external address and signature type
+                    let key_hash = make_link_jmt_key_hash(signature_type, external_address);
+                    
+                    match tree.get(key_hash, version) {
+                        Ok(Some(bytes)) => {
+                            match <ExternalLink as borsh::BorshDeserialize>::try_from_slice(&bytes) {
+                                Ok(link) => serde_json::to_value(&link).map_err(|e| {
+                                    ErrorObjectOwned::owned(-32001, "Failed to serialize Link", Some(e.to_string()))
+                                })?,
+                                Err(e) => return Err(ErrorObjectOwned::owned(-32001, "Failed to deserialize Link", Some(e.to_string()))),
+                            }
+                        }
+                        Ok(None) => Value::Null,
+                        Err(e) => return Err(ErrorObjectOwned::owned(-32001, "Failed to query JMT", Some(e.to_string()))),
+                    }
+                }
                 _ => {
-                    return Err(ErrorObjectOwned::owned(-32602, "Unsupported type. Use: Account, Coin, or CoinStore", None::<String>));
+                    return Err(ErrorObjectOwned::owned(-32602, "Unsupported type. Use: Account, Coin, CoinStore, or Link", None::<String>));
                 }
             };
 
@@ -400,7 +390,7 @@ async fn main() {
 
     let server_handle = server.start(module);
     println!("🔌 JSON-RPC server listening on http://127.0.0.1:9944");
-    println!("   Methods: submit_borsh_tx, view");
+    println!("   Methods: submit_borsh_tx, view (types: Account, Coin, CoinStore, Link)");
 
     // Keep the node alive using tokio::select! (exit on RPC stop or ctrl-c)
     tokio::select! {

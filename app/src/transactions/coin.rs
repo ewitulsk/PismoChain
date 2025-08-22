@@ -1,3 +1,5 @@
+use std::vec;
+
 use hotstuff_rs::block_tree::accessors::app::AppBlockTreeView;
 use hotstuff_rs::block_tree::pluggables::KVStore;
 use jmt::{KeyHash, OwnedValue};
@@ -100,6 +102,13 @@ pub fn build_mint_updates<K: KVStore>(
         
         // Update the coin's total supply
         coin.total_supply = coin.total_supply.saturating_add(amount);
+
+        if let Some(max_supply) = coin.max_supply {
+            if coin.total_supply > max_supply{
+                return (vec![], vec![]);
+            }
+        }
+        
         
         // Derive the coin store address
         let coin_store_addr = derive_coin_store_addr(&account_addr, &coin_addr);

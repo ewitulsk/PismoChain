@@ -8,7 +8,7 @@ use crate::jmt_state::make_key_hash_from_parts;
 use crate::standards::accounts::{
     Account, AccountMeta, ExternalLink, Policy, ScopeBits,
     default_algo_for_signature_type, derive_account_addr, make_account_object_key, make_link_object_key,
-    get_account_from_signer,
+    get_account_from_signer, make_link_jmt_key_hash,
 };
 use crate::transactions::{SignerType, SignatureType};
 
@@ -26,7 +26,7 @@ pub fn build_create_account_updates<K: KVStore>(
     println!("Creating account at address: {:?} (hex: {})", account_addr, account_addr_hex);
     let link = ExternalLink {
         signature_type,
-        address: signing_pub_key.clone(),
+        account_addr,
         algo: default_algo_for_signature_type(signature_type),
         added_at: created_at_ms,
     };
@@ -49,13 +49,19 @@ pub fn build_create_account_updates<K: KVStore>(
 
     let account_bytes = <Account as borsh::BorshSerialize>::try_to_vec(&account).unwrap();
     let jmt_key = make_key_hash_from_parts(account_addr, b"acct");
-    println!("Made account at key_hash: {:?}", jmt_key);
-    let jmt_writes = vec![(jmt_key, Some(account_bytes.clone()))];
+    
+    // Create link object for JMT storage - use external signer address for key derivation
+    let link_val = <ExternalLink as borsh::BorshSerialize>::try_to_vec(&link).unwrap();
+    let link_jmt_key = make_link_jmt_key_hash(signature_type, &signing_pub_key);
+    
+    let jmt_writes = vec![
+        (jmt_key, Some(account_bytes.clone())),
+        (link_jmt_key, Some(link_val.clone()))
+    ];
 
     let mut mirror: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     mirror.push((make_account_object_key(&account_addr), account_bytes));
     let link_key = make_link_object_key(signature_type, &signing_pub_key);
-    let link_val = <ExternalLink as borsh::BorshSerialize>::try_to_vec(&link).unwrap();
     mirror.push((link_key, link_val));
 
     (jmt_writes, mirror)
@@ -83,7 +89,7 @@ pub fn build_link_account_updates<K: KVStore>(
         // Add the new external link
         let link = ExternalLink {
             signature_type,
-            address: external_wallet.to_string(),
+            account_addr,
             algo: default_algo_for_signature_type(signature_type),
             added_at: added_at_ms,
         };
@@ -95,9 +101,12 @@ pub fn build_link_account_updates<K: KVStore>(
         jmt_writes.push((jmt_key, Some(account_bytes.clone())));
         mirror.push((make_account_object_key(&account_addr), account_bytes));
 
-        // Create the link object
-        let link_key = make_link_object_key(signature_type, external_wallet);
+        // Create the link object for both JMT and mirror storage - use external wallet address for key derivation
         let link_val = <ExternalLink as borsh::BorshSerialize>::try_to_vec(&link).unwrap();
+        let link_jmt_key = make_link_jmt_key_hash(signature_type, external_wallet);
+        jmt_writes.push((link_jmt_key, Some(link_val.clone())));
+        
+        let link_key = make_link_object_key(signature_type, external_wallet);
         mirror.push((link_key, link_val));
     }
 
