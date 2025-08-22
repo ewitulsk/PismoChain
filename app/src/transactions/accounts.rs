@@ -22,7 +22,8 @@ pub fn build_create_account_updates<K: KVStore>(
     _version: u64,
 ) -> (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>) {
     let account_addr = derive_account_addr(1, signature_type, &signing_pub_key);
-
+    let account_addr_hex = hex::encode(account_addr);
+    println!("Creating account at address: {:?} (hex: {})", account_addr, account_addr_hex);
     let link = ExternalLink {
         signature_type,
         address: signing_pub_key.clone(),
@@ -48,6 +49,7 @@ pub fn build_create_account_updates<K: KVStore>(
 
     let account_bytes = <Account as borsh::BorshSerialize>::try_to_vec(&account).unwrap();
     let jmt_key = make_key_hash_from_parts(account_addr, b"acct");
+    println!("Made account at key_hash: {:?}", jmt_key);
     let jmt_writes = vec![(jmt_key, Some(account_bytes.clone()))];
 
     let mut mirror: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();

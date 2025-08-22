@@ -15,6 +15,10 @@ use std::{
 use utils::{
     submit_transactions::submit_transaction,
 };
+use standards::{
+    accounts::Account,
+    coin::{Coin, CoinStore},
+};
 use database::mem_db::MemDB;
 use pismo_app_jmt::PismoAppJMT;
 use pismo_app_jmt::PismoTransaction;
@@ -44,6 +48,9 @@ use std::{
     sync::mpsc::{self, Receiver, Sender, TryRecvError},
     collections::HashMap,
 };
+
+use crate::jmt_state::make_key_hash_from_parts;
+use jmt::{JellyfishMerkleTree, storage::TreeReader, KeyHash, Version, OwnedValue, storage::{Node, NodeKey, LeafNode}};
 
  
 
@@ -174,6 +181,7 @@ async fn main() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     
     // Build and start the replica with the original kv_store
+    let kv_store_for_rpc = kv_store.clone(); // Clone KV store for RPC access
     let _replica = ReplicaSpec::builder()
         .app(pismo_app)
         .network(MockNetwork::new(verifying_key))
@@ -240,8 +248,159 @@ async fn main() {
         })
         .expect("register method");
 
+    // Add view method for querying state using JMT
+    let kv_store_for_view = kv_store_for_rpc.clone();
+    module
+        .register_method("view", move |params, _mdata, _ctx| {
+            use jsonrpsee::types::ErrorObjectOwned;
+            use serde_json::Value;
+            use hotstuff_rs::block_tree::pluggables::KVStore;
+
+            // Simple JMT reader that works directly with KVStore for RPC queries
+            struct DirectJMTReader<'a, K: KVStore> {
+                kv_store: &'a K,
+            }
+
+            impl<'a, K: KVStore> TreeReader for DirectJMTReader<'a, K> {
+                fn get_node_option(&self, node_key: &NodeKey) -> anyhow::Result<Option<Node>> {
+                    let mut key = Vec::new();
+                    key.push(3); // COMMITTED_APP_STATE prefix from HotStuff
+                    key.extend_from_slice(b"__jmt_node__");
+                    key.extend_from_slice(&bincode::serialize(node_key)?);
+                    
+                    Ok(self.kv_store.get(&key)
+                        .map(|bytes| bincode::deserialize(&bytes))
+                        .transpose()?)
+                }
+
+                fn get_value_option(&self, max_version: Version, key_hash: KeyHash) -> anyhow::Result<Option<OwnedValue>> {
+                    println!("Getting latest value");
+                    
+                    // Check the latest version index for this key
+                    let mut latest_key = Vec::new();
+                    latest_key.push(3); // COMMITTED_APP_STATE prefix from HotStuff
+                    latest_key.extend_from_slice(b"__jmt_latest__");
+                    latest_key.extend_from_slice(&key_hash.0);
+                    
+                    if let Some(vbytes) = self.kv_store.get(&latest_key) {
+                        if vbytes.len() >= 8 {
+                            let latest = Version::from_le_bytes(vbytes[..8].try_into()?);
+                            
+                            if latest <= max_version {
+                                let mut value_key = Vec::new();
+                                value_key.push(3); // COMMITTED_APP_STATE prefix from HotStuff
+                                value_key.extend_from_slice(b"__jmt_value__");
+                                value_key.extend_from_slice(&latest.to_le_bytes());
+                                value_key.extend_from_slice(&key_hash.0);
+                                return Ok(self.kv_store.get(&value_key));
+                            }
+                        }
+                    }
+                    Ok(None)
+                }
+
+                fn get_rightmost_leaf(&self) -> anyhow::Result<Option<(NodeKey, LeafNode)>> {
+                    Ok(None) // Not needed for simple queries
+                }
+            }
+
+            // Parse parameters: {"address": "hex_string", "type": "Account|Coin|CoinStore"}
+            let params_obj: Value = params.parse()?;
+            
+            let address_hex = params_obj.get("address")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ErrorObjectOwned::owned(-32602, "Missing 'address' parameter", None::<String>))?;
+                
+            let struct_type = params_obj.get("type")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ErrorObjectOwned::owned(-32602, "Missing 'type' parameter", None::<String>))?;
+
+            // Decode hex address to bytes
+            let address_bytes = hex::decode(address_hex).map_err(|e| {
+                ErrorObjectOwned::owned(-32602, "Invalid hex address", Some(e.to_string()))
+            })?;
+
+            if address_bytes.len() != 32 {
+                return Err(ErrorObjectOwned::owned(-32602, "Address must be 32 bytes", None::<String>));
+            }
+
+            let address: [u8; 32] = address_bytes.try_into().unwrap();
+            println!("View looking for address: {:?}", address);
+
+            // Create JMT reader and tree directly with KVStore
+            let reader = DirectJMTReader { kv_store: &kv_store_for_view };
+            let tree = JellyfishMerkleTree::<_, sha2::Sha256>::new(&reader);
+            
+            // Use u64::MAX as version to get the latest committed value
+            let version = u64::MAX;
+
+            // Query based on struct type using JMT
+            let result = match struct_type {
+                "Account" => {
+                    // Create JMT key hash for account
+                    let key_hash = make_key_hash_from_parts(address, b"acct");
+                    
+                    println!("Looking for account with key_hash: {:?}", key_hash);
+                    
+                    match tree.get(key_hash, version) {
+                        Ok(Some(bytes)) => {
+                            match <Account as borsh::BorshDeserialize>::try_from_slice(&bytes) {
+                                Ok(account) => serde_json::to_value(&account).map_err(|e| {
+                                    ErrorObjectOwned::owned(-32001, "Failed to serialize Account", Some(e.to_string()))
+                                })?,
+                                Err(e) => return Err(ErrorObjectOwned::owned(-32001, "Failed to deserialize Account", Some(e.to_string()))),
+                            }
+                        }
+                        Ok(None) => Value::Null,
+                        Err(e) => return Err(ErrorObjectOwned::owned(-32001, "Failed to query JMT", Some(e.to_string()))),
+                    }
+                }
+                "Coin" => {
+                    // Create JMT key hash for coin
+                    let key_hash = make_key_hash_from_parts(address, b"coin");
+                    
+                    match tree.get(key_hash, version) {
+                        Ok(Some(bytes)) => {
+                            match <Coin as borsh::BorshDeserialize>::try_from_slice(&bytes) {
+                                Ok(coin) => serde_json::to_value(&coin).map_err(|e| {
+                                    ErrorObjectOwned::owned(-32001, "Failed to serialize Coin", Some(e.to_string()))
+                                })?,
+                                Err(e) => return Err(ErrorObjectOwned::owned(-32001, "Failed to deserialize Coin", Some(e.to_string()))),
+                            }
+                        }
+                        Ok(None) => Value::Null,
+                        Err(e) => return Err(ErrorObjectOwned::owned(-32001, "Failed to query JMT", Some(e.to_string()))),
+                    }
+                }
+                "CoinStore" => {
+                    // Create JMT key hash for coin store
+                    let key_hash = make_key_hash_from_parts(address, b"store");
+                    
+                    match tree.get(key_hash, version) {
+                        Ok(Some(bytes)) => {
+                            match <CoinStore as borsh::BorshDeserialize>::try_from_slice(&bytes) {
+                                Ok(coin_store) => serde_json::to_value(&coin_store).map_err(|e| {
+                                    ErrorObjectOwned::owned(-32001, "Failed to serialize CoinStore", Some(e.to_string()))
+                                })?,
+                                Err(e) => return Err(ErrorObjectOwned::owned(-32001, "Failed to deserialize CoinStore", Some(e.to_string()))),
+                            }
+                        }
+                        Ok(None) => Value::Null,
+                        Err(e) => return Err(ErrorObjectOwned::owned(-32001, "Failed to query JMT", Some(e.to_string()))),
+                    }
+                }
+                _ => {
+                    return Err(ErrorObjectOwned::owned(-32602, "Unsupported type. Use: Account, Coin, or CoinStore", None::<String>));
+                }
+            };
+
+            Ok(result)
+        })
+        .expect("register view method");
+
     let server_handle = server.start(module);
-    println!("🔌 JSON-RPC server listening on http://127.0.0.1:9944 (method: submit_borsh_tx)");
+    println!("🔌 JSON-RPC server listening on http://127.0.0.1:9944");
+    println!("   Methods: submit_borsh_tx, view");
 
     // Keep the node alive using tokio::select! (exit on RPC stop or ctrl-c)
     tokio::select! {
