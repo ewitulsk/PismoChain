@@ -35,7 +35,7 @@ use jmt::{KeyHash, RootHash, OwnedValue, proof::SparseMerkleProof};
 
 use crate::transactions::accounts::{build_create_account_updates, build_link_account_updates};
 use crate::transactions::noop::build_noop_updates;
-use crate::transactions::coin::{build_new_coin_updates, build_mint_updates};
+use crate::transactions::coin::{build_new_coin_updates, build_mint_updates, build_transfer_updates};
  
 
 /// Counter-specific transaction operations that can be performed
@@ -44,13 +44,10 @@ pub enum PismoOperation {
     /// Process an onramp transaction with VAA verification
     Onramp(String, u64), // vaa string, guardian_set index
     /// Create a new account from an external wallet link
-    CreateAccount {
-        created_at_ms: u64,
-    },
+    CreateAccount,
     /// Link a new external wallet to an existing account
     LinkAccount {
         external_wallet: String,
-        added_at_ms: u64,
     },
     /// No-operation transaction that only increments the account nonce
     NoOp,
@@ -69,7 +66,15 @@ pub enum PismoOperation {
         account_addr: [u8; 32],
         amount: u128,
     },
+    /// Transfer tokens between accounts
+    Transfer {
+        coin_addr: [u8; 32],
+        receiver_addr: [u8; 32],
+        amount: u128,
+    },
 }
+
+
 
 /// Type alias for counter transactions
 pub type PismoTransaction = Transaction<PismoOperation>;
@@ -405,13 +410,13 @@ impl PismoAppJMT {
                         }
                     }
                 }
-                PismoOperation::CreateAccount { created_at_ms } => {
-                    let (writes, mirrors) = build_create_account_updates(signature_type, signing_pub_key.clone(), *created_at_ms, signer_type, block_tree, version);
+                PismoOperation::CreateAccount => {
+                    let (writes, mirrors) = build_create_account_updates(signature_type, signing_pub_key.clone(), signer_type, block_tree, version);
                     jmt_writes.extend(writes);
                     app_mirror_inserts.extend(mirrors);
                 }
-                PismoOperation::LinkAccount { external_wallet, added_at_ms } => {
-                    let (writes, mirrors) = build_link_account_updates(signing_pub_key.clone(), external_wallet, signature_type, signer_address, signer_type, *added_at_ms, block_tree, version);
+                PismoOperation::LinkAccount { external_wallet } => {
+                    let (writes, mirrors) = build_link_account_updates(signing_pub_key.clone(), external_wallet, signature_type, signer_address, signer_type, block_tree, version);
                     jmt_writes.extend(writes);
                     app_mirror_inserts.extend(mirrors);
                 }
@@ -442,6 +447,21 @@ impl PismoAppJMT {
                     let (writes, mirrors) = build_mint_updates(
                         *coin_addr,
                         *account_addr,
+                        *amount,
+                        signing_pub_key.clone(),
+                        signer_address,
+                        signer_type,
+                        signature_type,
+                        block_tree,
+                        version
+                    );
+                    jmt_writes.extend(writes);
+                    app_mirror_inserts.extend(mirrors);
+                }
+                PismoOperation::Transfer { coin_addr, receiver_addr, amount } => {
+                    let (writes, mirrors) = build_transfer_updates(
+                        *coin_addr,
+                        *receiver_addr,
                         *amount,
                         signing_pub_key.clone(),
                         signer_address,

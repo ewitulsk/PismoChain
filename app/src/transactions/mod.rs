@@ -54,7 +54,7 @@ pub struct Transaction<P> {
     /// Address/identifier of the transaction signer (could be different from sender for delegation)
     pub signer: String,
     /// The actual transaction payload
-    pub payload: P,
+    pub payload: P, //Vec<P>
     /// Cryptographic signature for transaction validation
     pub signature: Option<Vec<u8>>, // Store as bytes for serialization
     /// Hash of the transaction data for integrity verification
@@ -192,7 +192,7 @@ impl Transaction<PismoOperation> {
         // Nonce checks per payload type
         let nonce_ok = match &self.payload {
             // For create, account must not yet exist and nonce must be 0
-            PismoOperation::CreateAccount { .. } => {
+            PismoOperation::CreateAccount => {
                 let derived_addr: AccountAddr = derive_account_addr(1, self.signature_type, &self.public_key);
                 let existing: Option<Account> = get_account(block_tree, &derived_addr);
                 existing.is_none() && self.nonce == 0
@@ -211,12 +211,11 @@ impl Transaction<PismoOperation> {
             }
             // For NoOp, the account must exist and tx.nonce must equal current_nonce
             PismoOperation::NoOp => {
-                // if let Some(account) = get_account(block_tree, version.saturating_sub(1), account_addr) {
-                //     self.nonce == account.current_nonce
-                // } else {
-                //     false
-                // }
-                false
+                if let Some(account) = get_account_from_signer(block_tree, &self.signer, self.signer_type, self.signature_type, &self.public_key) {
+                    self.nonce == account.current_nonce
+                } else {
+                    false
+                }
             }
             // For NewCoin, the account must exist and tx.nonce must equal current_nonce
             PismoOperation::NewCoin { .. } => {
@@ -230,6 +229,14 @@ impl Transaction<PismoOperation> {
             }
             // For Mint, the account must exist and tx.nonce must equal current_nonce
             PismoOperation::Mint { .. } => {
+                if let Some(account) = get_account_from_signer(block_tree, &self.signer, self.signer_type, self.signature_type, &self.public_key) {
+                    self.nonce == account.current_nonce
+                } else {
+                    false
+                }
+            }
+            // For Transfer, the account must exist and tx.nonce must equal current_nonce
+            PismoOperation::Transfer { .. } => {
                 if let Some(account) = get_account_from_signer(block_tree, &self.signer, self.signer_type, self.signature_type, &self.public_key) {
                     self.nonce == account.current_nonce
                 } else {

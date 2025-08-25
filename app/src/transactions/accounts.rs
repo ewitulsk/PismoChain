@@ -16,7 +16,6 @@ use crate::transactions::{SignerType, SignatureType};
 pub fn build_create_account_updates<K: KVStore>(
     signature_type: SignatureType,
     signing_pub_key: String,
-    created_at_ms: u64,
     _signer_type: SignerType,
     _block_tree: &AppBlockTreeView<'_, K>,
     _version: u64,
@@ -28,7 +27,6 @@ pub fn build_create_account_updates<K: KVStore>(
         signature_type,
         account_addr,
         algo: default_algo_for_signature_type(signature_type),
-        added_at: created_at_ms,
     };
 
     let mut links = std::collections::BTreeSet::new();
@@ -43,7 +41,7 @@ pub fn build_create_account_updates<K: KVStore>(
             require_owner_for: ScopeBits::ACCOUNT_ADMIN,
             guardian_quorum: 0,
         },
-        meta: AccountMeta { created_at: created_at_ms, bumped: 0, frozen: false },
+        meta: AccountMeta { bumped: 0, frozen: false },
         current_nonce: 0
     };
 
@@ -75,7 +73,6 @@ pub fn build_link_account_updates<K: KVStore>(
     signature_type: SignatureType,
     signer_address: &str,
     signer_type: SignerType,
-    added_at_ms: u64,
     block_tree: &AppBlockTreeView<'_, K>,
     _version: u64,
 ) -> (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>) {
@@ -91,7 +88,6 @@ pub fn build_link_account_updates<K: KVStore>(
             signature_type,
             account_addr,
             algo: default_algo_for_signature_type(signature_type),
-            added_at: added_at_ms,
         };
         account.links.insert(link.clone());
         

@@ -39,7 +39,6 @@ pub struct ExternalLink {
     pub signature_type: SignatureType,
     pub account_addr: AccountAddr, // The account address this external link points to
     pub algo: KeyAlgo,
-    pub added_at: UnixMillis,
 }
 
 bitflags::bitflags! {
@@ -82,7 +81,6 @@ pub struct Policy {
 
 #[derive(Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug)]
 pub struct AccountMeta {
-    pub created_at: UnixMillis,
     pub bumped: u8,
     pub frozen: bool
 }

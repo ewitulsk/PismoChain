@@ -58,6 +58,20 @@ export type MintInput = {
   hashBytes?: Uint8Array
 }
 
+export type TransferInput = {
+  publicKeyHex: string
+  signer: string
+  coinAddr: Uint8Array // 32 bytes
+  receiverAddr: Uint8Array // 32 bytes
+  amount: bigint
+  nonce: bigint
+  chainId: number
+  signatureType: number
+  signerType: number
+  signatureBytes?: Uint8Array
+  hashBytes?: Uint8Array
+}
+
 export function serializeCreateAccountTx(input: CreateAccountInput): Uint8Array {
   const writer = new BorshWriter()
 
@@ -69,8 +83,7 @@ export function serializeCreateAccountTx(input: CreateAccountInput): Uint8Array 
 
   // payload: enum PismoOperation (u8 tag + fields)
   writer.writeU8(1) // CreateAccount tag
-  // created_at_ms: u64 LE
-  writer.writeU64LE(input.createdAtMs)
+  // CreateAccount is a unit variant - no additional fields
 
   // signature: Option<Vec<u8>>
   if (input.signatureBytes) {
@@ -187,6 +200,44 @@ export function serializeMintTx(input: MintInput): Uint8Array {
   return writer.concat()
 }
 
+export function serializeTransferTx(input: TransferInput): Uint8Array {
+  const writer = new BorshWriter()
+
+  // public_key: string
+  writer.writeString(input.publicKeyHex)
+  // signer: string
+  writer.writeString(input.signer)
+
+  // payload: Transfer variant (tag = 6 based on enum order: Onramp=0, CreateAccount=1, LinkAccount=2, NoOp=3, NewCoin=4, Mint=5, Transfer=6)
+  writer.writeU8(6) // Transfer tag
+  writer.writeBytes(input.coinAddr) // [u8; 32]
+  writer.writeBytes(input.receiverAddr) // [u8; 32]
+  writer.writeU128LE(input.amount)
+
+  // signature: Option<Vec<u8>>
+  if (input.signatureBytes) {
+    writer.writeU8(1)
+    writer.writeVecU8(input.signatureBytes)
+  } else {
+    writer.writeU8(0)
+  }
+
+  // hash: Option<Vec<u8>>
+  if (input.hashBytes) {
+    writer.writeU8(1)
+    writer.writeVecU8(input.hashBytes)
+  } else {
+    writer.writeU8(0)
+  }
+
+  writer.writeU64LE(input.nonce)
+  writer.writeU16LE(input.chainId)
+  writer.writeU8(input.signatureType)
+  writer.writeU8(input.signerType)
+
+  return writer.concat()
+}
+
 export function buildCreateAccountPrehash(
   publicKeyHex: string,
   signer: string,
@@ -197,7 +248,7 @@ export function buildCreateAccountPrehash(
   // Backend hash = hash(public_key | signer | borsh(payload) | nonce | chain_id)
   const payloadWriter = new BorshWriter()
   payloadWriter.writeU8(1) // CreateAccount tag
-  payloadWriter.writeU64LE(createdAtMs)
+  // CreateAccount is a unit variant - no additional fields
   const payloadBytes = payloadWriter.concat()
 
   const w = new BorshWriter()
@@ -267,6 +318,35 @@ export function buildMintPrehash(
   payloadWriter.writeU8(5) // Mint tag
   payloadWriter.writeBytes(coinAddr)
   payloadWriter.writeBytes(accountAddr)
+  payloadWriter.writeU128LE(amount)
+  const payloadBytes = payloadWriter.concat()
+
+  // Build envelope hash
+  const w = new BorshWriter()
+  w.writeString(publicKeyHex)
+  w.writeString(signer)
+  w.writeBytes(payloadBytes)
+  w.writeU64LE(nonce)
+  w.writeU16LE(chainId)
+  const preimage = w.concat()
+  const digest = sha256(preimage)
+  return new Uint8Array(digest)
+}
+
+export function buildTransferPrehash(
+  publicKeyHex: string,
+  signer: string,
+  coinAddr: Uint8Array,
+  receiverAddr: Uint8Array,
+  amount: bigint,
+  nonce: bigint,
+  chainId: number,
+): Uint8Array {
+  // Build payload bytes
+  const payloadWriter = new BorshWriter()
+  payloadWriter.writeU8(6) // Transfer tag
+  payloadWriter.writeBytes(coinAddr)
+  payloadWriter.writeBytes(receiverAddr)
   payloadWriter.writeU128LE(amount)
   const payloadBytes = payloadWriter.concat()
 

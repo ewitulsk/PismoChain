@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import { 
   buildCreateAccountPrehash, buildPhantomEnvelope, exampleSignerString, serializeCreateAccountTx, 
-  serializeNewCoinTx, serializeMintTx, buildNewCoinPrehash, buildMintPrehash,
+  serializeNewCoinTx, serializeMintTx, serializeTransferTx, buildNewCoinPrehash, buildMintPrehash, buildTransferPrehash,
   SignatureType, SignerType, toBase64Borsh, deriveCoinAddr, deriveAccountAddr, deriveCoinStoreAddr, viewQuery
 } from '../lib/pismo'
 import { registerSlushWallet, SLUSH_WALLET_NAME } from '@mysten/slush-wallet'
@@ -99,6 +99,10 @@ export default function App() {
   const [activeWalletType, setActiveWalletType] = useState<'phantom' | 'sui' | null>(null)
   const [currentNonce, setCurrentNonce] = useState<bigint>(BigInt(0))
   const [accountAddress, setAccountAddress] = useState<string>('')
+  const [transferReceiverAddress, setTransferReceiverAddress] = useState<string>('')
+  const [transferAmount, setTransferAmount] = useState<string>('1000')
+  const [transferCoinAddress, setTransferCoinAddress] = useState<string>('')
+  const [lastTransferReceiverCoinStore, setLastTransferReceiverCoinStore] = useState<string>('')
 
   const signerStr = useMemo(() => pubkeyBase58 ? exampleSignerString(pubkeyBase58) : '', [pubkeyBase58])
 
@@ -493,11 +497,118 @@ export default function App() {
     }
   }, [currentWallet, coinAddress, currentNonce, refreshNonce])
 
+  const onTransfer = useCallback(async () => {
+    try {
+      if (!currentWallet) throw new Error('Connect a wallet first')
+      if (!transferCoinAddress.trim()) throw new Error('Enter coin address')
+      if (!transferReceiverAddress.trim()) throw new Error('Enter receiver address')
+
+      // Convert hex coin address back to bytes
+      let coinAddrBytes: Uint8Array
+      try {
+        coinAddrBytes = new Uint8Array(transferCoinAddress.trim().match(/.{2}/g)!.map(hex => parseInt(hex, 16)))
+        if (coinAddrBytes.length !== 32) {
+          throw new Error('Coin address must be exactly 32 bytes (64 hex characters)')
+        }
+      } catch (e) {
+        throw new Error('Invalid coin address format. Must be a 64-character hex string.')
+      }
+      
+      // Convert hex receiver address to bytes
+      let receiverAddrBytes: Uint8Array
+      try {
+        receiverAddrBytes = new Uint8Array(transferReceiverAddress.trim().match(/.{2}/g)!.map(hex => parseInt(hex, 16)))
+        if (receiverAddrBytes.length !== 32) {
+          throw new Error('Receiver address must be exactly 32 bytes (64 hex characters)')
+        }
+      } catch (e) {
+        throw new Error('Invalid receiver address format. Must be a 64-character hex string.')
+      }
+      
+      const amount = BigInt(transferAmount) // Transfer amount from input
+      const nonce = currentNonce // Use actual current nonce
+      const chainId = 2
+
+      // Build hash
+      const hash = buildTransferPrehash(
+        currentWallet.publicKeyHex,
+        currentWallet.signer,
+        coinAddrBytes,
+        receiverAddrBytes,
+        amount,
+        nonce,
+        chainId
+      )
+
+      // Build envelope and sign
+      const envelope = buildPhantomEnvelope({
+        app: 'example.com',
+        purpose: 'session-key binding',
+        dataBytes: hash,
+        nonce,
+      })
+      
+      setStatus('Requesting signature...')
+      const signature = await currentWallet.signMessage(new TextEncoder().encode(envelope))
+
+      // Serialize transaction
+      const txBytes = serializeTransferTx({
+        publicKeyHex: currentWallet.publicKeyHex,
+        signer: currentWallet.signer,
+        coinAddr: coinAddrBytes,
+        receiverAddr: receiverAddrBytes,
+        amount,
+        nonce,
+        chainId,
+        signatureType: currentWallet.signatureType,
+        signerType: currentWallet.signerType,
+        signatureBytes: signature,
+        hashBytes: hash,
+      })
+
+      const base64Tx = toBase64Borsh(txBytes)
+
+      // Submit to backend
+      setStatus('Submitting Transfer transaction...')
+      const res = await fetch('/rpc', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'submit_borsh_tx',
+          params: [base64Tx],
+        }),
+      })
+
+      const json = await res.json().catch(() => ({}))
+      setSubmitResult(json)
+      if (res.ok) {
+        // Calculate and store the receiver's coinstore address
+        const receiverCoinStoreAddr = deriveCoinStoreAddr(receiverAddrBytes, coinAddrBytes)
+        const receiverCoinStoreHex = Array.from(receiverCoinStoreAddr).map(b => b.toString(16).padStart(2, '0')).join('')
+        setLastTransferReceiverCoinStore(receiverCoinStoreHex)
+        
+        setStatus('Transfer transaction submitted')
+        // Wait a moment for the transaction to be processed, then refresh nonce
+        setTimeout(() => refreshNonce(), 1000)
+      } else {
+        setStatus(`Submit error: HTTP ${res.status}`)
+      }
+    } catch (e: any) {
+      console.error(e)
+      setStatus(`Error: ${e?.message || e}`)
+    }
+  }, [currentWallet, transferCoinAddress, transferReceiverAddress, transferAmount, currentNonce, refreshNonce])
+
   const onDisconnectWallet = useCallback(() => {
     setActiveWalletType(null)
     setCoinAddress('')
     setAccountAddress('')
     setCurrentNonce(BigInt(0))
+    setTransferReceiverAddress('')
+    setTransferCoinAddress('')
+    setLastTransferReceiverCoinStore('')
     setStatus('Wallet disconnected')
   }, [])
 
@@ -571,6 +682,14 @@ export default function App() {
       // For Link queries, we use the external wallet address (public key hex)
       setViewAddress(currentWallet.publicKeyHex)
       setViewType('Link')
+    }
+  }, [currentWallet])
+
+  const populateReceiverWithMyAccount = useCallback(() => {
+    if (currentWallet) {
+      const accountAddr = deriveAccountAddr(1, currentWallet.signatureType, currentWallet.publicKeyHex)
+      const hexAddr = Array.from(accountAddr).map(b => b.toString(16).padStart(2, '0')).join('')
+      setTransferReceiverAddress(hexAddr)
     }
   }, [currentWallet])
 
@@ -655,6 +774,127 @@ export default function App() {
           Mint Tokens
         </button>
       </div>
+
+      {/* Transfer Section */}
+      <div style={{ marginBottom: 16, padding: 16, border: '1px solid #e1e5e9', borderRadius: 8, background: '#fafbfc' }}>
+        <h3 style={{ margin: '0 0 16px 0', fontSize: '16px' }}>Transfer Tokens</h3>
+        
+        <div style={{ display: 'grid', gap: 8, marginBottom: 12 }}>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <label style={{ minWidth: '120px', fontSize: '14px' }}>Coin Address:</label>
+            <input
+              type="text"
+              placeholder="Enter 64-character hex coin address"
+              value={transferCoinAddress}
+              onChange={(e) => setTransferCoinAddress(e.target.value)}
+              style={{ flex: 1, padding: '6px 8px', border: '1px solid #ccc', borderRadius: 4, fontSize: '12px', fontFamily: 'monospace' }}
+            />
+            {coinAddress && (
+              <button 
+                onClick={() => setTransferCoinAddress(coinAddress)} 
+                style={{ padding: '4px 8px', fontSize: '12px', whiteSpace: 'nowrap' }}
+              >
+                Use My Coin
+              </button>
+            )}
+          </div>
+          
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <label style={{ minWidth: '120px', fontSize: '14px' }}>Receiver Address:</label>
+            <input
+              type="text"
+              placeholder="Enter 64-character hex address"
+              value={transferReceiverAddress}
+              onChange={(e) => setTransferReceiverAddress(e.target.value)}
+              style={{ flex: 1, padding: '6px 8px', border: '1px solid #ccc', borderRadius: 4, fontSize: '12px', fontFamily: 'monospace' }}
+            />
+            <button 
+              onClick={populateReceiverWithMyAccount} 
+              disabled={!currentWallet}
+              style={{ padding: '4px 8px', fontSize: '12px', whiteSpace: 'nowrap' }}
+            >
+              Use My Account
+            </button>
+          </div>
+          
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <label style={{ minWidth: '120px', fontSize: '14px' }}>Amount:</label>
+            <input
+              type="number"
+              placeholder="Amount to transfer"
+              value={transferAmount}
+              onChange={(e) => setTransferAmount(e.target.value)}
+              style={{ flex: 1, padding: '6px 8px', border: '1px solid #ccc', borderRadius: 4 }}
+              min="1"
+            />
+          </div>
+        </div>
+        
+        <button 
+          onClick={onTransfer} 
+          disabled={!currentWallet || !transferCoinAddress.trim() || !transferReceiverAddress.trim()}
+          style={{ 
+            padding: '8px 16px', 
+            backgroundColor: !currentWallet || !transferCoinAddress.trim() || !transferReceiverAddress.trim() ? '#f0f0f0' : '#0066cc', 
+            color: !currentWallet || !transferCoinAddress.trim() || !transferReceiverAddress.trim() ? '#666' : 'white',
+            border: 'none', 
+            borderRadius: 4, 
+            cursor: !currentWallet || !transferCoinAddress.trim() || !transferReceiverAddress.trim() ? 'not-allowed' : 'pointer' 
+          }}
+        >
+          Transfer Tokens
+        </button>
+        
+        {!currentWallet && (
+          <div style={{ marginTop: 8, fontSize: '12px', color: '#666' }}>
+            Connect a wallet first
+          </div>
+        )}
+      </div>
+
+      {/* Display receiver's coinstore address after successful transfer */}
+      {lastTransferReceiverCoinStore && (
+        <div style={{ marginBottom: 16, padding: 12, border: '1px solid #d1f2eb', borderRadius: 8, background: '#d5f4e6' }}>
+          <div style={{ marginBottom: 8 }}>
+            <strong style={{ color: '#0f5132' }}>✅ Transfer Completed</strong>
+          </div>
+          <div style={{ marginBottom: 4, fontSize: '14px' }}>
+            <strong>Receiver's CoinStore Address:</strong>
+          </div>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <code style={{ 
+              display: 'block', 
+              background: '#ffffff', 
+              padding: 8, 
+              borderRadius: 4, 
+              fontSize: '12px', 
+              wordBreak: 'break-all',
+              flex: 1,
+              border: '1px solid #c3e6cb'
+            }}>
+              {lastTransferReceiverCoinStore}
+            </code>
+            <button 
+              onClick={() => {
+                setViewAddress(lastTransferReceiverCoinStore)
+                setViewType('CoinStore')
+              }}
+              style={{ 
+                padding: '4px 8px', 
+                fontSize: '12px', 
+                backgroundColor: '#198754',
+                color: 'white',
+                border: 'none',
+                borderRadius: 4,
+                cursor: 'pointer',
+                whiteSpace: 'nowrap'
+              }}
+            >
+              View Balance
+            </button>
+          </div>
+        </div>
+      )}
 
       {coinAddress && (
         <div style={{ marginBottom: 16 }}>

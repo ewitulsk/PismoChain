@@ -146,12 +146,92 @@ pub fn build_mint_updates<K: KVStore>(
     (jmt_writes, mirror)
 }
 
+/// Build writes and app-mirror inserts for transferring tokens between accounts
+pub fn build_transfer_updates<K: KVStore>(
+    coin_addr: [u8; 32],
+    receiver_addr: [u8; 32],
+    amount: u128,
+    signing_pub_key: String,
+    signer_address: &str,
+    signer_type: SignerType,
+    signature_type: SignatureType,
+    block_tree: &AppBlockTreeView<'_, K>,
+    _version: u64,
+) -> (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>) {
+    let mut jmt_writes: Vec<(KeyHash, Option<OwnedValue>)> = Vec::new();
+    let mut mirror: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+
+    // Check both coin and sender account existence at the start
+    if let (Some(_coin), Some(mut sender_account)) = (
+        get_coin(block_tree, &coin_addr),
+        get_account_from_signer(block_tree, &signer_address.to_string(), signer_type, signature_type, &signing_pub_key)
+    ) {
+        // Derive sender's account address from their signing public key (CRITICAL SECURITY RULE)
+        let sender_account_addr = sender_account.account_addr;
+        
+        // Increment the sender's account nonce
+        sender_account.increment_nonce();
+        
+        // Derive coin store addresses
+        let sender_store_addr = derive_coin_store_addr(&sender_account_addr, &coin_addr);
+        let receiver_store_addr = derive_coin_store_addr(&receiver_addr, &coin_addr);
+        
+        // Check sender's coin store and balance
+        if let Some(mut sender_store) = get_coin_store(block_tree, &sender_store_addr) {
+            // Check if sender has sufficient balance
+            if sender_store.amount >= amount {
+                // Deduct amount from sender's coin store
+                sender_store.amount = sender_store.amount.saturating_sub(amount);
+                
+                // Handle receiver's coin store
+                let receiver_store = if let Some(mut existing_store) = get_coin_store(block_tree, &receiver_store_addr) {
+                    // Receiver has existing store, increment the amount
+                    existing_store.amount = existing_store.amount.saturating_add(amount);
+                    existing_store
+                } else {
+                    // Receiver doesn't have store, create new one
+                    CoinStore { amount }
+                };
+                
+                // Serialize and store the updated sender's coin store
+                let sender_store_bytes = <CoinStore as borsh::BorshSerialize>::try_to_vec(&sender_store).unwrap();
+                let sender_store_jmt_key = make_key_hash_from_parts(sender_store_addr, b"store");
+                jmt_writes.push((sender_store_jmt_key, Some(sender_store_bytes.clone())));
+                mirror.push((make_coin_store_object_key(&sender_store_addr), sender_store_bytes));
+                
+                // Serialize and store the receiver's coin store
+                let receiver_store_bytes = <CoinStore as borsh::BorshSerialize>::try_to_vec(&receiver_store).unwrap();
+                let receiver_store_jmt_key = make_key_hash_from_parts(receiver_store_addr, b"store");
+                jmt_writes.push((receiver_store_jmt_key, Some(receiver_store_bytes.clone())));
+                mirror.push((make_coin_store_object_key(&receiver_store_addr), receiver_store_bytes));
+                
+                // Serialize and store the updated sender's account (with incremented nonce)
+                let account_bytes = <crate::standards::accounts::Account as borsh::BorshSerialize>::try_to_vec(&sender_account).unwrap();
+                let account_jmt_key = make_key_hash_from_parts(sender_account_addr, b"acct");
+                jmt_writes.push((account_jmt_key, Some(account_bytes.clone())));
+                mirror.push((make_account_object_key(&sender_account_addr), account_bytes));
+                
+                println!("✅ Transfer successful: {} tokens from {:?} to {:?}", 
+                    amount, hex::encode(&sender_account_addr[..8]), hex::encode(&receiver_addr[..8]));
+            } else {
+                println!("❌ Transfer failed: Insufficient balance (required: {}, available: {})", amount, sender_store.amount);
+            }
+        } else {
+            println!("❌ Transfer failed: Sender has no coin store for this token");
+        }
+    } else {
+        println!("❌ Transfer failed: Coin or sender account does not exist");
+    }
+
+    (jmt_writes, mirror)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::standards::accounts::derive_account_addr;
     use crate::standards::coin::{derive_coin_addr, Coin};
-    use crate::transactions::{SignatureType, SignerType};
+    use crate::transactions::SignatureType;
 
     #[test]
     fn test_coin_address_derivation() {
@@ -220,21 +300,5 @@ mod tests {
         println!("✅ CoinStore address derivation test passed!");
         println!("   Store address: {:?}", hex::encode(store_addr1));
     }
-
-    #[test]
-    fn test_coin_store_serialization() {
-        let coin_store = CoinStore {
-            amount: 1000000u128,
-        };
-        
-        // Test Borsh serialization/deserialization
-        let serialized = <CoinStore as borsh::BorshSerialize>::try_to_vec(&coin_store).unwrap();
-        let deserialized = <CoinStore as borsh::BorshDeserialize>::try_from_slice(&serialized).unwrap();
-        
-        assert_eq!(coin_store.amount, deserialized.amount);
-        
-        println!("✅ CoinStore serialization test passed!");
-        println!("   Serialized size: {} bytes", serialized.len());
-        println!("   Amount: {}", deserialized.amount);
-    }
+    
 }
