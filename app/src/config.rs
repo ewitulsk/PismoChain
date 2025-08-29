@@ -6,6 +6,7 @@ use std::env;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub chain_id: u16,
+    pub network: String,
     pub sui: Sui,
 }
 

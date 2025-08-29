@@ -36,11 +36,6 @@ pub fn build_create_account_updates<K: KVStore>(
         account_addr,
         links,
         sessions: BTreeMap::new(),
-        policy: Policy {
-            max_session_lifetime_ms: 1000 * 60 * 60 * 24 * 30, // 30d
-            require_owner_for: ScopeBits::ACCOUNT_ADMIN,
-            guardian_quorum: 0,
-        },
         meta: AccountMeta { bumped: 0, frozen: false },
         current_nonce: 0
     };

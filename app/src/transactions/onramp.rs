@@ -2,7 +2,12 @@ use wormhole_vaas::{utils, Readable, Vaa, VaaBody, Writeable};
 use base64::Engine;
 use hex::FromHex;
 use anyhow::{Result, anyhow};
-// Serde imports are kept for potential future use with config serialization
+use hotstuff_rs::block_tree::accessors::app::AppBlockTreeView;
+use hotstuff_rs::block_tree::pluggables::KVStore;
+use jmt::{KeyHash, OwnedValue};
+use crate::jmt_state::make_key_hash_from_parts;
+use crate::standards::coin::{Coin, CoinStore, derive_bridged_coin_addr, make_coin_object_key, derive_coin_store_addr, make_coin_store_object_key, get_coin, get_coin_store};
+use crate::config::Config;
 
 /// Guardian set information with quorum calculation
 #[derive(Debug, Clone)]
@@ -16,7 +21,7 @@ pub struct OnrampMessage {
     pub emitter_chain: u16,
     pub amount: u64,
     pub sender: String,      // hex string
-    pub recipient: String,   // hex string
+    pub recipient: String,   // hex string (This is the recipients PismoChain account address)
     pub token_address: String,
     pub timestamp: u64,
 }
@@ -189,9 +194,8 @@ fn sig_is_valid(sig: &wormhole_vaas::GuardianSetSig, digest: &[u8; 32], guardian
 }
 
 /// Main VAA verification function
-pub fn verify_vaa_and_extract_message(vaa_raw: &str, guardian_set_index: u64) -> Result<OnrampMessage> {
-    // Use testnet for now - this could be configurable
-    let network = "testnet";
+pub fn verify_vaa_and_extract_message(vaa_raw: &str, guardian_set_index: u64, config: &Config) -> Result<OnrampMessage> {
+    let network = &config.network;
     
     let bytes = base64::prelude::BASE64_STANDARD.decode(vaa_raw)
         .map_err(|e| anyhow!("Failed to decode base64 VAA: {}", e))?;
@@ -231,4 +235,109 @@ pub fn verify_vaa_and_extract_message(vaa_raw: &str, guardian_set_index: u64) ->
             needed
         ))
     }
+}
+
+/// Build writes and app-mirror inserts for processing an onramp transaction
+pub fn build_onramp_updates<K: KVStore>(
+    vaa: &str,
+    guardian_set_index: u64,
+    config: &Config,
+    block_tree: &AppBlockTreeView<'_, K>,
+    _version: u64,
+) -> (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>) {
+    let mut jmt_writes: Vec<(KeyHash, Option<OwnedValue>)> = Vec::new();
+    let mut mirror: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+
+    // Step 1: Verify VAA and extract message
+    let onramp_message = match verify_vaa_and_extract_message(vaa, guardian_set_index, config) {
+        Ok(msg) => {
+            println!("🚀 Successfully verified VAA for onramp!");
+            msg
+        }
+        Err(e) => {
+            println!("❌ Failed to verify VAA: {}", e);
+            return (jmt_writes, mirror); // Return empty updates
+        }
+    };
+
+    // Step 2: Parse recipient address from hex string to [u8; 32]
+    let recipient_addr: [u8; 32] = {
+        let recipient_hex = onramp_message.recipient.trim_start_matches("0x");
+        match hex::decode(recipient_hex) {
+            Ok(bytes) if bytes.len() == 32 => {
+                let mut addr = [0u8; 32];
+                addr.copy_from_slice(&bytes);
+                addr
+            }
+            Ok(bytes) => {
+                println!("❌ Invalid recipient address length: expected 32 bytes, got {}", bytes.len());
+                return (jmt_writes, mirror);
+            }
+            Err(e) => {
+                println!("❌ Failed to decode recipient address: {}", e);
+                return (jmt_writes, mirror);
+            }
+        }
+    };
+
+    // Step 3: Derive bridged coin address
+    let coin_addr = derive_bridged_coin_addr(&onramp_message.token_address, onramp_message.emitter_chain);
+    
+    // Step 4: Check/Create/Update Coin
+    let coin = if let Some(mut existing_coin) = get_coin(block_tree, &coin_addr) {
+        // Coin exists, increment total supply
+        existing_coin.total_supply = existing_coin.total_supply.saturating_add(onramp_message.amount as u128);
+        println!("📊 Updating bridged coin total supply to {}", existing_coin.total_supply);
+        existing_coin
+    } else {
+        // Create new bridged coin
+        let coin = Coin {
+            name: format!("Bridge_{}_Chain{}", 
+                &onramp_message.token_address[..8.min(onramp_message.token_address.len())], 
+                onramp_message.emitter_chain),
+            project_uri: String::new(),
+            logo_uri: String::new(),
+            total_supply: onramp_message.amount as u128,
+            max_supply: None, // No max supply for bridged tokens
+            canonical_chain_id: onramp_message.emitter_chain as u64,
+        };
+        println!("🪙 Creating new bridged coin: {}", coin.name);
+        coin
+    };
+
+    // Step 5: Check/Update recipient's coin store
+    let coin_store_addr = derive_coin_store_addr(&recipient_addr, &coin_addr);
+    let coin_store = if let Some(mut existing_store) = get_coin_store(block_tree, &coin_store_addr) {
+        // Store exists, increment amount
+        existing_store.amount = existing_store.amount.saturating_add(onramp_message.amount as u128);
+        println!("💰 Adding {} tokens to existing store (new balance: {})", 
+            onramp_message.amount, existing_store.amount);
+        existing_store
+    } else {
+        // Create new coin store
+        let store = CoinStore {
+            amount: onramp_message.amount as u128,
+        };
+        println!("💰 Creating new coin store with {} tokens", onramp_message.amount);
+        store
+    };
+
+    // Serialize and store the coin
+    let coin_bytes = <Coin as borsh::BorshSerialize>::try_to_vec(&coin).unwrap();
+    let coin_jmt_key = make_key_hash_from_parts(coin_addr, b"coin");
+    jmt_writes.push((coin_jmt_key, Some(coin_bytes.clone())));
+    mirror.push((make_coin_object_key(&coin_addr), coin_bytes));
+
+    // Serialize and store the coin store
+    let store_bytes = <CoinStore as borsh::BorshSerialize>::try_to_vec(&coin_store).unwrap();
+    let store_jmt_key = make_key_hash_from_parts(coin_store_addr, b"store");
+    jmt_writes.push((store_jmt_key, Some(store_bytes.clone())));
+    mirror.push((make_coin_store_object_key(&coin_store_addr), store_bytes));
+
+    println!("✅ Onramp successful: {} tokens bridged from chain {} to recipient {:?}", 
+        onramp_message.amount,
+        onramp_message.emitter_chain,
+        hex::encode(&recipient_addr[..8]));
+
+    (jmt_writes, mirror)
 }

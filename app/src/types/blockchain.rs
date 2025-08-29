@@ -13,4 +13,4 @@ pub enum Blockchain {
         /// The checkpoint sequence number to query the object at
         checkpoint: u64,
     },
-} 
+}

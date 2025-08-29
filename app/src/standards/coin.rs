@@ -36,6 +36,17 @@ pub fn derive_coin_addr(seed_addr: &AccountAddr, name: &str, canonical_chain_id:
     out
 }
 
+/// Generate the bridged coin address using Sha3(token_address || emitter_chain)
+pub fn derive_bridged_coin_addr(token_address: &str, emitter_chain: u16) -> CoinAddr {
+    let mut hasher = Sha3_256::new();
+    hasher.update(token_address.as_bytes());
+    hasher.update(emitter_chain.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest[..32]);
+    out
+}
+
 /// Create the object key for storing coin data in the app state
 pub fn make_coin_object_key(coin_addr: &CoinAddr) -> Vec<u8> {
     let mut k = b"coin/".to_vec();

@@ -76,7 +76,6 @@ pub struct SessionKey {
 pub struct Policy {
     pub max_session_lifetime_ms: u64,
     pub require_owner_for: ScopeBits,
-    pub guardian_quorum: u8,
 }
 
 #[derive(Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug)]
@@ -89,7 +88,6 @@ pub struct Account {
     pub account_addr: AccountAddr,
     pub links: BTreeSet<ExternalLink>,
     pub sessions: BTreeMap<[u8; 32], SessionKey>,
-    pub policy: Policy,
     pub meta: AccountMeta,
     pub current_nonce: u64
 }

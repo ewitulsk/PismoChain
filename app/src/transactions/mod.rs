@@ -4,6 +4,8 @@ pub mod onramp;
 pub mod accounts;
 pub mod noop;
 pub mod coin;
+pub mod orderbook;
+pub mod book_executor;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 
@@ -237,6 +239,22 @@ impl Transaction<PismoOperation> {
             }
             // For Transfer, the account must exist and tx.nonce must equal current_nonce
             PismoOperation::Transfer { .. } => {
+                if let Some(account) = get_account_from_signer(block_tree, &self.signer, self.signer_type, self.signature_type, &self.public_key) {
+                    self.nonce == account.current_nonce
+                } else {
+                    false
+                }
+            }
+            // For CreateOrderbook, the account must exist and tx.nonce must equal current_nonce
+            PismoOperation::CreateOrderbook { .. } => {
+                if let Some(account) = get_account_from_signer(block_tree, &self.signer, self.signer_type, self.signature_type, &self.public_key) {
+                    self.nonce == account.current_nonce
+                } else {
+                    false
+                }
+            }
+            // For NewLimitOrder, the account must exist and tx.nonce must equal current_nonce
+            PismoOperation::NewLimitOrder { .. } => {
                 if let Some(account) = get_account_from_signer(block_tree, &self.signer, self.signer_type, self.signature_type, &self.public_key) {
                     self.nonce == account.current_nonce
                 } else {

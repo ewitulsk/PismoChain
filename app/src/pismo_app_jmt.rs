@@ -27,7 +27,7 @@ use hotstuff_rs::{
 // No direct use of Sui PublicKey needed for verification path now
 
 use crate::transactions::Transaction;
-use crate::transactions::onramp;
+use crate::transactions::onramp::build_onramp_updates;
 use crate::config::Config;
 use crate::jmt_state::{make_state_key, make_key_hash_from_parts, get_jmt_root, get_jmt_value, compute_jmt_updates, get_with_proof};
 use hotstuff_rs::block_tree::pluggables::KVStore;
@@ -36,6 +36,7 @@ use jmt::{KeyHash, RootHash, OwnedValue, proof::SparseMerkleProof};
 use crate::transactions::accounts::{build_create_account_updates, build_link_account_updates};
 use crate::transactions::noop::build_noop_updates;
 use crate::transactions::coin::{build_new_coin_updates, build_mint_updates, build_transfer_updates};
+use crate::transactions::orderbook::{build_create_orderbook_updates, build_new_limit_order_updates};
  
 
 /// Counter-specific transaction operations that can be performed
@@ -71,6 +72,18 @@ pub enum PismoOperation {
         coin_addr: [u8; 32],
         receiver_addr: [u8; 32],
         amount: u128,
+    },
+    /// Create a new spot orderbook for a trading pair
+    CreateOrderbook {
+        buy_asset: String,
+        sell_asset: String,
+    },
+    /// Place a new limit order in an orderbook
+    NewLimitOrder {
+        orderbook_address: [u8; 32],
+        is_buy: bool,
+        amount: u128,
+        tick_price: u64,
     },
 }
 
@@ -394,21 +407,9 @@ impl PismoAppJMT {
             match &transaction.payload {
                 // Remove counter-only transactions per new requirements
                 PismoOperation::Onramp(vaa, guardian_set_index) => {
-                    // Verify VAA and extract onramp message
-                    match onramp::verify_vaa_and_extract_message(vaa, *guardian_set_index) {
-                        Ok(onramp_message) => {
-                            println!("🚀 Successfully processed Onramp transaction!");
-                            println!("OnrampMessage: {:#?}", onramp_message);
-                            
-                            // TODO: Update user balances based on onramp_message
-                            // For now, we'll just log the success
-                        }
-                        Err(e) => {
-                            println!("❌ Failed to process Onramp transaction: {}", e);
-                            // For now, we continue processing other transactions
-                            // In a real system, you might want to reject the entire block
-                        }
-                    }
+                    let (writes, mirrors) = build_onramp_updates(vaa, *guardian_set_index, &self.config, block_tree, version);
+                    jmt_writes.extend(writes);
+                    app_mirror_inserts.extend(mirrors);
                 }
                 PismoOperation::CreateAccount => {
                     let (writes, mirrors) = build_create_account_updates(signature_type, signing_pub_key.clone(), signer_type, block_tree, version);
@@ -463,6 +464,36 @@ impl PismoAppJMT {
                         *coin_addr,
                         *receiver_addr,
                         *amount,
+                        signing_pub_key.clone(),
+                        signer_address,
+                        signer_type,
+                        signature_type,
+                        block_tree,
+                        version
+                    );
+                    jmt_writes.extend(writes);
+                    app_mirror_inserts.extend(mirrors);
+                }
+                PismoOperation::CreateOrderbook { buy_asset, sell_asset } => {
+                    let (writes, mirrors) = build_create_orderbook_updates(
+                        buy_asset.clone(),
+                        sell_asset.clone(),
+                        signing_pub_key.clone(),
+                        signer_address,
+                        signer_type,
+                        signature_type,
+                        block_tree,
+                        version
+                    );
+                    jmt_writes.extend(writes);
+                    app_mirror_inserts.extend(mirrors);
+                }
+                PismoOperation::NewLimitOrder { orderbook_address, is_buy, amount, tick_price } => {
+                    let (writes, mirrors) = build_new_limit_order_updates(
+                        *orderbook_address,
+                        *is_buy,
+                        *amount,
+                        *tick_price,
                         signing_pub_key.clone(),
                         signer_address,
                         signer_type,
