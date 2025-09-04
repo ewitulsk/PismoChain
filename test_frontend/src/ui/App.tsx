@@ -1,9 +1,11 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import { 
   buildCreateAccountPrehash, buildPhantomEnvelope, exampleSignerString, serializeCreateAccountTx, 
-  serializeNewCoinTx, serializeMintTx, serializeTransferTx, buildNewCoinPrehash, buildMintPrehash, buildTransferPrehash,
-  SignatureType, SignerType, toBase64Borsh, deriveCoinAddr, deriveAccountAddr, deriveCoinStoreAddr, viewQuery
+  serializeNewCoinTx, serializeMintTx, serializeTransferTx, serializeCreateOrderbookTx, serializeNewLimitOrderTx,
+  buildNewCoinPrehash, buildMintPrehash, buildTransferPrehash, buildCreateOrderbookPrehash, buildNewLimitOrderPrehash,
+  SignatureType, SignerType, toBase64Borsh, deriveCoinAddr, deriveAccountAddr, deriveCoinStoreAddr, deriveOrderbookAddr, viewQuery
 } from '../lib/pismo'
+import OrderbookVisualizer from './OrderbookVisualizer'
 import { registerSlushWallet, SLUSH_WALLET_NAME } from '@mysten/slush-wallet'
 import { getWallets } from '@wallet-standard/app'
 import type { Wallet, WalletWithFeatures } from '@wallet-standard/core'
@@ -103,6 +105,17 @@ export default function App() {
   const [transferAmount, setTransferAmount] = useState<string>('1000')
   const [transferCoinAddress, setTransferCoinAddress] = useState<string>('')
   const [lastTransferReceiverCoinStore, setLastTransferReceiverCoinStore] = useState<string>('')
+  
+  // Orderbook state
+  const [orderbookBuyAsset, setOrderbookBuyAsset] = useState<string>('')
+  const [orderbookSellAsset, setOrderbookSellAsset] = useState<string>('')
+  const [createdOrderbookAddress, setCreatedOrderbookAddress] = useState<string>('')
+  
+  // Limit order state
+  const [limitOrderOrderbookAddress, setLimitOrderOrderbookAddress] = useState<string>('')
+  const [limitOrderIsBuy, setLimitOrderIsBuy] = useState<boolean>(true)
+  const [limitOrderAmount, setLimitOrderAmount] = useState<string>('1000')
+  const [limitOrderTickPrice, setLimitOrderTickPrice] = useState<string>('100')
 
   const signerStr = useMemo(() => pubkeyBase58 ? exampleSignerString(pubkeyBase58) : '', [pubkeyBase58])
 
@@ -601,6 +614,178 @@ export default function App() {
     }
   }, [currentWallet, transferCoinAddress, transferReceiverAddress, transferAmount, currentNonce, refreshNonce])
 
+  const onCreateOrderbook = useCallback(async () => {
+    try {
+      if (!currentWallet) throw new Error('Connect a wallet first')
+      if (!orderbookBuyAsset.trim()) throw new Error('Enter buy asset address')
+      if (!orderbookSellAsset.trim()) throw new Error('Enter sell asset address')
+
+      // Validate hex addresses
+      if (orderbookBuyAsset.trim().length !== 64) throw new Error('Buy asset address must be 64 hex characters')
+      if (orderbookSellAsset.trim().length !== 64) throw new Error('Sell asset address must be 64 hex characters')
+
+      const nonce = currentNonce
+      const chainId = 2
+
+      // Build hash
+      const hash = buildCreateOrderbookPrehash(
+        currentWallet.publicKeyHex,
+        currentWallet.signer,
+        orderbookBuyAsset.trim(),
+        orderbookSellAsset.trim(),
+        nonce,
+        chainId
+      )
+
+      // Build envelope and sign
+      const envelope = buildPhantomEnvelope({
+        app: 'example.com',
+        purpose: 'session-key binding',
+        dataBytes: hash,
+        nonce,
+      })
+      
+      setStatus('Requesting signature...')
+      const signature = await currentWallet.signMessage(new TextEncoder().encode(envelope))
+
+      // Serialize transaction
+      const txBytes = serializeCreateOrderbookTx({
+        publicKeyHex: currentWallet.publicKeyHex,
+        signer: currentWallet.signer,
+        buyAsset: orderbookBuyAsset.trim(),
+        sellAsset: orderbookSellAsset.trim(),
+        nonce,
+        chainId,
+        signatureType: currentWallet.signatureType,
+        signerType: currentWallet.signerType,
+        signatureBytes: signature,
+        hashBytes: hash,
+      })
+
+      const base64Tx = toBase64Borsh(txBytes)
+
+      // Submit to backend
+      setStatus('Submitting CreateOrderbook transaction...')
+      const res = await fetch('/rpc', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'submit_borsh_tx',
+          params: [base64Tx],
+        }),
+      })
+
+      const json = await res.json().catch(() => ({}))
+      setSubmitResult(json)
+      if (res.ok) {
+        // Calculate and store the orderbook address
+        const buyAssetBytes = new Uint8Array(orderbookBuyAsset.trim().match(/.{2}/g)!.map(hex => parseInt(hex, 16)))
+        const sellAssetBytes = new Uint8Array(orderbookSellAsset.trim().match(/.{2}/g)!.map(hex => parseInt(hex, 16)))
+        const orderbookAddr = deriveOrderbookAddr(buyAssetBytes, sellAssetBytes)
+        const orderbookAddrHex = Array.from(orderbookAddr).map(b => b.toString(16).padStart(2, '0')).join('')
+        setCreatedOrderbookAddress(orderbookAddrHex)
+        
+        setStatus('CreateOrderbook transaction submitted')
+        // Wait a moment for the transaction to be processed, then refresh nonce
+        setTimeout(() => refreshNonce(), 1000)
+      } else {
+        setStatus(`Submit error: HTTP ${res.status}`)
+      }
+    } catch (e: any) {
+      console.error(e)
+      setStatus(`Error: ${e?.message || e}`)
+    }
+  }, [currentWallet, orderbookBuyAsset, orderbookSellAsset, currentNonce, refreshNonce])
+
+  const onPlaceLimitOrder = useCallback(async () => {
+    try {
+      if (!currentWallet) throw new Error('Connect a wallet first')
+      if (!limitOrderOrderbookAddress.trim()) throw new Error('Enter orderbook address')
+      if (!limitOrderAmount.trim()) throw new Error('Enter order amount')
+      if (!limitOrderTickPrice.trim()) throw new Error('Enter tick price')
+
+      // Validate orderbook address
+      if (limitOrderOrderbookAddress.trim().length !== 64) throw new Error('Orderbook address must be 64 hex characters')
+
+      // Convert hex orderbook address to bytes
+      const orderbookAddrBytes = new Uint8Array(limitOrderOrderbookAddress.trim().match(/.{2}/g)!.map(hex => parseInt(hex, 16)))
+      
+      const amount = BigInt(limitOrderAmount)
+      const tickPrice = BigInt(limitOrderTickPrice)
+      const nonce = currentNonce
+      const chainId = 2
+
+      // Build hash
+      const hash = buildNewLimitOrderPrehash(
+        currentWallet.publicKeyHex,
+        currentWallet.signer,
+        orderbookAddrBytes,
+        limitOrderIsBuy,
+        amount,
+        tickPrice,
+        nonce,
+        chainId
+      )
+
+      // Build envelope and sign
+      const envelope = buildPhantomEnvelope({
+        app: 'example.com',
+        purpose: 'session-key binding',
+        dataBytes: hash,
+        nonce,
+      })
+      
+      setStatus('Requesting signature...')
+      const signature = await currentWallet.signMessage(new TextEncoder().encode(envelope))
+
+      // Serialize transaction
+      const txBytes = serializeNewLimitOrderTx({
+        publicKeyHex: currentWallet.publicKeyHex,
+        signer: currentWallet.signer,
+        orderbookAddress: orderbookAddrBytes,
+        isBuy: limitOrderIsBuy,
+        amount,
+        tickPrice,
+        nonce,
+        chainId,
+        signatureType: currentWallet.signatureType,
+        signerType: currentWallet.signerType,
+        signatureBytes: signature,
+        hashBytes: hash,
+      })
+
+      const base64Tx = toBase64Borsh(txBytes)
+
+      // Submit to backend
+      setStatus('Submitting NewLimitOrder transaction...')
+      const res = await fetch('/rpc', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'submit_borsh_tx',
+          params: [base64Tx],
+        }),
+      })
+
+      const json = await res.json().catch(() => ({}))
+      setSubmitResult(json)
+      if (res.ok) {
+        setStatus(`${limitOrderIsBuy ? 'BUY' : 'SELL'} limit order submitted`)
+        // Wait a moment for the transaction to be processed, then refresh nonce
+        setTimeout(() => refreshNonce(), 1000)
+      } else {
+        setStatus(`Submit error: HTTP ${res.status}`)
+      }
+    } catch (e: any) {
+      console.error(e)
+      setStatus(`Error: ${e?.message || e}`)
+    }
+  }, [currentWallet, limitOrderOrderbookAddress, limitOrderIsBuy, limitOrderAmount, limitOrderTickPrice, currentNonce, refreshNonce])
+
   const onDisconnectWallet = useCallback(() => {
     setActiveWalletType(null)
     setCoinAddress('')
@@ -609,6 +794,11 @@ export default function App() {
     setTransferReceiverAddress('')
     setTransferCoinAddress('')
     setLastTransferReceiverCoinStore('')
+    // Clear orderbook state
+    setOrderbookBuyAsset('')
+    setOrderbookSellAsset('')
+    setCreatedOrderbookAddress('')
+    setLimitOrderOrderbookAddress('')
     setStatus('Wallet disconnected')
   }, [])
 
@@ -907,6 +1097,176 @@ export default function App() {
 
       <hr style={{ margin: '24px 0' }} />
 
+      <h2>Orderbook Operations</h2>
+      
+      {/* Create Orderbook Section */}
+      <div style={{ marginBottom: 16, padding: 16, border: '1px solid #e1e5e9', borderRadius: 8, background: '#fafbfc' }}>
+        <h3 style={{ margin: '0 0 16px 0', fontSize: '16px' }}>Create Orderbook</h3>
+        
+        <div style={{ display: 'grid', gap: 8, marginBottom: 12 }}>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <label style={{ minWidth: '120px', fontSize: '14px' }}>Buy Asset:</label>
+            <input
+              type="text"
+              placeholder="Enter 64-character hex coin address"
+              value={orderbookBuyAsset}
+              onChange={(e) => setOrderbookBuyAsset(e.target.value)}
+              style={{ flex: 1, padding: '6px 8px', border: '1px solid #ccc', borderRadius: 4, fontSize: '12px', fontFamily: 'monospace' }}
+            />
+            {coinAddress && (
+              <button 
+                onClick={() => setOrderbookBuyAsset(coinAddress)} 
+                style={{ padding: '4px 8px', fontSize: '12px', whiteSpace: 'nowrap' }}
+              >
+                Use My Coin
+              </button>
+            )}
+          </div>
+          
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <label style={{ minWidth: '120px', fontSize: '14px' }}>Sell Asset:</label>
+            <input
+              type="text"
+              placeholder="Enter 64-character hex coin address"
+              value={orderbookSellAsset}
+              onChange={(e) => setOrderbookSellAsset(e.target.value)}
+              style={{ flex: 1, padding: '6px 8px', border: '1px solid #ccc', borderRadius: 4, fontSize: '12px', fontFamily: 'monospace' }}
+            />
+            {coinAddress && (
+              <button 
+                onClick={() => setOrderbookSellAsset(coinAddress)} 
+                style={{ padding: '4px 8px', fontSize: '12px', whiteSpace: 'nowrap' }}
+              >
+                Use My Coin
+              </button>
+            )}
+          </div>
+        </div>
+        
+        <button 
+          onClick={onCreateOrderbook} 
+          disabled={!currentWallet || !orderbookBuyAsset.trim() || !orderbookSellAsset.trim()}
+          style={{ 
+            padding: '8px 16px', 
+            backgroundColor: !currentWallet || !orderbookBuyAsset.trim() || !orderbookSellAsset.trim() ? '#f0f0f0' : '#0066cc', 
+            color: !currentWallet || !orderbookBuyAsset.trim() || !orderbookSellAsset.trim() ? '#666' : 'white',
+            border: 'none', 
+            borderRadius: 4, 
+            cursor: !currentWallet || !orderbookBuyAsset.trim() || !orderbookSellAsset.trim() ? 'not-allowed' : 'pointer' 
+          }}
+        >
+          Create Orderbook
+        </button>
+      </div>
+
+      {/* Display created orderbook address */}
+      {createdOrderbookAddress && (
+        <div style={{ marginBottom: 16, padding: 12, border: '1px solid #d1f2eb', borderRadius: 8, background: '#d5f4e6' }}>
+          <div style={{ marginBottom: 8 }}>
+            <strong style={{ color: '#0f5132' }}>✅ Orderbook Created</strong>
+          </div>
+          <div style={{ marginBottom: 4, fontSize: '14px' }}>
+            <strong>Orderbook Address:</strong>
+          </div>
+          <code style={{ 
+            display: 'block', 
+            background: '#ffffff', 
+            padding: 8, 
+            borderRadius: 4, 
+            fontSize: '12px', 
+            wordBreak: 'break-all',
+            border: '1px solid #c3e6cb'
+          }}>
+            {createdOrderbookAddress}
+          </code>
+        </div>
+      )}
+
+      {/* Place Limit Order Section */}
+      <div style={{ marginBottom: 16, padding: 16, border: '1px solid #e1e5e9', borderRadius: 8, background: '#fafbfc' }}>
+        <h3 style={{ margin: '0 0 16px 0', fontSize: '16px' }}>Place Limit Order</h3>
+        
+        <div style={{ display: 'grid', gap: 8, marginBottom: 12 }}>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <label style={{ minWidth: '120px', fontSize: '14px' }}>Orderbook:</label>
+            <input
+              type="text"
+              placeholder="Enter 64-character hex orderbook address"
+              value={limitOrderOrderbookAddress}
+              onChange={(e) => setLimitOrderOrderbookAddress(e.target.value)}
+              style={{ flex: 1, padding: '6px 8px', border: '1px solid #ccc', borderRadius: 4, fontSize: '12px', fontFamily: 'monospace' }}
+            />
+            {createdOrderbookAddress && (
+              <button 
+                onClick={() => setLimitOrderOrderbookAddress(createdOrderbookAddress)} 
+                style={{ padding: '4px 8px', fontSize: '12px', whiteSpace: 'nowrap' }}
+              >
+                Use My Orderbook
+              </button>
+            )}
+          </div>
+          
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <label style={{ minWidth: '120px', fontSize: '14px' }}>Order Type:</label>
+            <select
+              value={limitOrderIsBuy ? 'buy' : 'sell'}
+              onChange={(e) => setLimitOrderIsBuy(e.target.value === 'buy')}
+              style={{ padding: '6px 8px', border: '1px solid #ccc', borderRadius: 4 }}
+            >
+              <option value="buy">BUY</option>
+              <option value="sell">SELL</option>
+            </select>
+          </div>
+          
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <label style={{ minWidth: '120px', fontSize: '14px' }}>Amount:</label>
+            <input
+              type="number"
+              placeholder="Order amount"
+              value={limitOrderAmount}
+              onChange={(e) => setLimitOrderAmount(e.target.value)}
+              style={{ flex: 1, padding: '6px 8px', border: '1px solid #ccc', borderRadius: 4 }}
+              min="1"
+            />
+          </div>
+          
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <label style={{ minWidth: '120px', fontSize: '14px' }}>Tick Price:</label>
+            <input
+              type="number"
+              placeholder="Price tick"
+              value={limitOrderTickPrice}
+              onChange={(e) => setLimitOrderTickPrice(e.target.value)}
+              style={{ flex: 1, padding: '6px 8px', border: '1px solid #ccc', borderRadius: 4 }}
+              min="1"
+            />
+          </div>
+        </div>
+        
+        <button 
+          onClick={onPlaceLimitOrder} 
+          disabled={!currentWallet || !limitOrderOrderbookAddress.trim() || !limitOrderAmount.trim() || !limitOrderTickPrice.trim()}
+          style={{ 
+            padding: '8px 16px', 
+            backgroundColor: !currentWallet || !limitOrderOrderbookAddress.trim() || !limitOrderAmount.trim() || !limitOrderTickPrice.trim() ? '#f0f0f0' : (limitOrderIsBuy ? '#28a745' : '#dc3545'), 
+            color: !currentWallet || !limitOrderOrderbookAddress.trim() || !limitOrderAmount.trim() || !limitOrderTickPrice.trim() ? '#666' : 'white',
+            border: 'none', 
+            borderRadius: 4, 
+            cursor: !currentWallet || !limitOrderOrderbookAddress.trim() || !limitOrderAmount.trim() || !limitOrderTickPrice.trim() ? 'not-allowed' : 'pointer' 
+          }}
+        >
+          Place {limitOrderIsBuy ? 'BUY' : 'SELL'} Order
+        </button>
+        
+        {!currentWallet && (
+          <div style={{ marginTop: 8, fontSize: '12px', color: '#666' }}>
+            Connect a wallet first
+          </div>
+        )}
+      </div>
+
+      <hr style={{ margin: '24px 0' }} />
+
       <h2>State Viewer</h2>
       <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 8 }}>
         <input
@@ -925,6 +1285,7 @@ export default function App() {
           <option value="Coin">Coin</option>
           <option value="CoinStore">CoinStore</option>
           <option value="Link">Link</option>
+          <option value="Orderbook">Orderbook</option>
         </select>
         <button onClick={onViewQuery}>Query</button>
       </div>
@@ -941,6 +1302,9 @@ export default function App() {
         </button>
         <button onClick={populateLinkAddress} disabled={!currentWallet} style={{ padding: '4px 8px' }}>
           My Link
+        </button>
+        <button onClick={() => { setViewAddress(createdOrderbookAddress); setViewType('Orderbook') }} disabled={!createdOrderbookAddress} style={{ padding: '4px 8px' }}>
+          My Orderbook
         </button>
       </div>
 
@@ -962,6 +1326,12 @@ export default function App() {
 {JSON.stringify(submitResult, null, 2)}
         </pre>
       )}
+
+      <hr style={{ margin: '24px 0' }} />
+
+      <OrderbookVisualizer initialOrderbookAddress={createdOrderbookAddress} />
+
+      <hr style={{ margin: '24px 0' }} />
 
       {!ready && (
         <p>

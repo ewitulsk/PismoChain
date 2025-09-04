@@ -72,6 +72,34 @@ export type TransferInput = {
   hashBytes?: Uint8Array
 }
 
+export type CreateOrderbookInput = {
+  publicKeyHex: string
+  signer: string
+  buyAsset: string // hex string of coin address
+  sellAsset: string // hex string of coin address
+  nonce: bigint
+  chainId: number
+  signatureType: number
+  signerType: number
+  signatureBytes?: Uint8Array
+  hashBytes?: Uint8Array
+}
+
+export type NewLimitOrderInput = {
+  publicKeyHex: string
+  signer: string
+  orderbookAddress: Uint8Array // 32 bytes
+  isBuy: boolean
+  amount: bigint
+  tickPrice: bigint
+  nonce: bigint
+  chainId: number
+  signatureType: number
+  signerType: number
+  signatureBytes?: Uint8Array
+  hashBytes?: Uint8Array
+}
+
 export function serializeCreateAccountTx(input: CreateAccountInput): Uint8Array {
   const writer = new BorshWriter()
 
@@ -238,6 +266,82 @@ export function serializeTransferTx(input: TransferInput): Uint8Array {
   return writer.concat()
 }
 
+export function serializeCreateOrderbookTx(input: CreateOrderbookInput): Uint8Array {
+  const writer = new BorshWriter()
+
+  // public_key: string
+  writer.writeString(input.publicKeyHex)
+  // signer: string
+  writer.writeString(input.signer)
+
+  // payload: CreateOrderbook variant (tag = 7 based on enum order: Onramp=0, CreateAccount=1, LinkAccount=2, NoOp=3, NewCoin=4, Mint=5, Transfer=6, CreateOrderbook=7)
+  writer.writeU8(7) // CreateOrderbook tag
+  writer.writeString(input.buyAsset) // buy_asset: String
+  writer.writeString(input.sellAsset) // sell_asset: String
+
+  // signature: Option<Vec<u8>>
+  if (input.signatureBytes) {
+    writer.writeU8(1)
+    writer.writeVecU8(input.signatureBytes)
+  } else {
+    writer.writeU8(0)
+  }
+
+  // hash: Option<Vec<u8>>
+  if (input.hashBytes) {
+    writer.writeU8(1)
+    writer.writeVecU8(input.hashBytes)
+  } else {
+    writer.writeU8(0)
+  }
+
+  writer.writeU64LE(input.nonce)
+  writer.writeU16LE(input.chainId)
+  writer.writeU8(input.signatureType)
+  writer.writeU8(input.signerType)
+
+  return writer.concat()
+}
+
+export function serializeNewLimitOrderTx(input: NewLimitOrderInput): Uint8Array {
+  const writer = new BorshWriter()
+
+  // public_key: string
+  writer.writeString(input.publicKeyHex)
+  // signer: string
+  writer.writeString(input.signer)
+
+  // payload: NewLimitOrder variant (tag = 8 based on enum order: Onramp=0, CreateAccount=1, LinkAccount=2, NoOp=3, NewCoin=4, Mint=5, Transfer=6, CreateOrderbook=7, NewLimitOrder=8)
+  writer.writeU8(8) // NewLimitOrder tag
+  writer.writeBytes(input.orderbookAddress) // orderbook_address: [u8; 32]
+  writer.writeU8(input.isBuy ? 1 : 0) // is_buy: bool
+  writer.writeU128LE(input.amount) // amount: u128
+  writer.writeU64LE(input.tickPrice) // tick_price: u64
+
+  // signature: Option<Vec<u8>>
+  if (input.signatureBytes) {
+    writer.writeU8(1)
+    writer.writeVecU8(input.signatureBytes)
+  } else {
+    writer.writeU8(0)
+  }
+
+  // hash: Option<Vec<u8>>
+  if (input.hashBytes) {
+    writer.writeU8(1)
+    writer.writeVecU8(input.hashBytes)
+  } else {
+    writer.writeU8(0)
+  }
+
+  writer.writeU64LE(input.nonce)
+  writer.writeU16LE(input.chainId)
+  writer.writeU8(input.signatureType)
+  writer.writeU8(input.signerType)
+
+  return writer.concat()
+}
+
 export function buildCreateAccountPrehash(
   publicKeyHex: string,
   signer: string,
@@ -362,6 +466,64 @@ export function buildTransferPrehash(
   return new Uint8Array(digest)
 }
 
+export function buildCreateOrderbookPrehash(
+  publicKeyHex: string,
+  signer: string,
+  buyAsset: string,
+  sellAsset: string,
+  nonce: bigint,
+  chainId: number,
+): Uint8Array {
+  // Build payload bytes
+  const payloadWriter = new BorshWriter()
+  payloadWriter.writeU8(7) // CreateOrderbook tag
+  payloadWriter.writeString(buyAsset)
+  payloadWriter.writeString(sellAsset)
+  const payloadBytes = payloadWriter.concat()
+
+  // Build envelope hash
+  const w = new BorshWriter()
+  w.writeString(publicKeyHex)
+  w.writeString(signer)
+  w.writeBytes(payloadBytes)
+  w.writeU64LE(nonce)
+  w.writeU16LE(chainId)
+  const preimage = w.concat()
+  const digest = sha256(preimage)
+  return new Uint8Array(digest)
+}
+
+export function buildNewLimitOrderPrehash(
+  publicKeyHex: string,
+  signer: string,
+  orderbookAddress: Uint8Array,
+  isBuy: boolean,
+  amount: bigint,
+  tickPrice: bigint,
+  nonce: bigint,
+  chainId: number,
+): Uint8Array {
+  // Build payload bytes
+  const payloadWriter = new BorshWriter()
+  payloadWriter.writeU8(8) // NewLimitOrder tag
+  payloadWriter.writeBytes(orderbookAddress)
+  payloadWriter.writeU8(isBuy ? 1 : 0)
+  payloadWriter.writeU128LE(amount)
+  payloadWriter.writeU64LE(tickPrice)
+  const payloadBytes = payloadWriter.concat()
+
+  // Build envelope hash
+  const w = new BorshWriter()
+  w.writeString(publicKeyHex)
+  w.writeString(signer)
+  w.writeBytes(payloadBytes)
+  w.writeU64LE(nonce)
+  w.writeU16LE(chainId)
+  const preimage = w.concat()
+  const digest = sha256(preimage)
+  return new Uint8Array(digest)
+}
+
 export function toBase64Borsh(bytes: Uint8Array): string {
   return base64Encode(bytes)
 }
@@ -456,6 +618,18 @@ export function deriveCoinStoreAddr(accountAddr: Uint8Array, coinAddr: Uint8Arra
   const combined = new Uint8Array(accountAddr.length + coinAddr.length)
   combined.set(accountAddr, 0)
   combined.set(coinAddr, accountAddr.length)
+  
+  // Use SHA3-256 to match backend exactly
+  return sha3_256(combined)
+}
+
+// Orderbook address derivation (matches backend implementation)
+export function deriveOrderbookAddr(buyAssetAddr: Uint8Array, sellAssetAddr: Uint8Array): Uint8Array {
+  // Replicate backend derive_orderbook_addr logic: Sha3(buy_asset || sell_asset || "spot_orderbook")
+  const combined = new Uint8Array(buyAssetAddr.length + sellAssetAddr.length + 14) // "spot_orderbook".length = 14
+  combined.set(buyAssetAddr, 0)
+  combined.set(sellAssetAddr, buyAssetAddr.length)
+  combined.set(new TextEncoder().encode('spot_orderbook'), buyAssetAddr.length + sellAssetAddr.length)
   
   // Use SHA3-256 to match backend exactly
   return sha3_256(combined)

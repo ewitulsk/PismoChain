@@ -14,27 +14,47 @@ pub struct Order {
     pub order_id: u128,
     /// Amount of the order
     pub amount: u128,
+    /// Account address that placed this order
+    pub account: [u8; 32],
 }
 
-/// Type alias for a list of (order_id, is_buy) tuples at a specific price tick
-pub type OrderList = Vec<(u128, bool)>;
+/// Type alias for a list of order IDs
+pub type OrderList = Vec<u128>;
+
+/// Tick structure that separates buy and sell orders at a specific price level
+#[derive(Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug)]
+pub struct Tick {
+    /// List of buy order IDs at this price level
+    pub buy_list: OrderList,
+    /// List of sell order IDs at this price level
+    pub sell_list: OrderList,
+}
+
+impl Tick {
+    pub fn new() -> Self {
+        Self {
+            buy_list: Vec::new(),
+            sell_list: Vec::new(),
+        }
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug)]
 pub struct Orderbook {
-    /// Asset being bought (base asset)
-    pub buy_asset: String,
-    /// Asset being sold (quote asset)  
-    pub sell_asset: String,
-    /// Map of price ticks to order ID lists (supports 2^64 possible price levels)
+    /// Asset being bought (base asset) - coin address
+    pub buy_asset: [u8; 32],
+    /// Asset being sold (quote asset) - coin address
+    pub sell_asset: [u8; 32],
+    /// Map of price ticks to tick data (supports 2^64 possible price levels)
     /// Using BorshIndexMap for fast access with deterministic serialization
-    pub ticks: BorshIndexMap<u64, OrderList>,
+    pub ticks: BorshIndexMap<u64, Tick>,
     /// Map from order ID to actual order data
     pub orders: BorshIndexMap<u128, Order>,
 }
 
 impl Orderbook {
     /// Create a new orderbook for a trading pair
-    pub fn new(buy_asset: String, sell_asset: String) -> Self {
+    pub fn new(buy_asset: [u8; 32], sell_asset: [u8; 32]) -> Self {
         Self {
             buy_asset,
             sell_asset,
@@ -48,15 +68,28 @@ impl Orderbook {
         let order_id = order.order_id;
         let is_buy = order.is_buy;
         self.orders.insert(order_id, order);
-        self.ticks.entry(tick).or_insert_with(Vec::new).push((order_id, is_buy));
+        
+        let tick_data = self.ticks.entry(tick).or_insert_with(Tick::new);
+        if is_buy {
+            tick_data.buy_list.push(order_id);
+        } else {
+            tick_data.sell_list.push(order_id);
+        }
     }
 
     /// Remove an order from the orderbook by order_id and tick
     pub fn remove_order(&mut self, tick: u64, order_id: u128) -> Option<Order> {
         if let Some(order) = self.orders.shift_remove(&order_id) {
-            if let Some(order_list) = self.ticks.get_mut(&tick) {
-                if let Some(pos) = order_list.iter().position(|(id, _)| *id == order_id) {
-                    order_list.remove(pos);
+            if let Some(tick_data) = self.ticks.get_mut(&tick) {
+                // Remove from the appropriate list based on order type
+                if order.is_buy {
+                    if let Some(pos) = tick_data.buy_list.iter().position(|&id| id == order_id) {
+                        tick_data.buy_list.remove(pos);
+                    }
+                } else {
+                    if let Some(pos) = tick_data.sell_list.iter().position(|&id| id == order_id) {
+                        tick_data.sell_list.remove(pos);
+                    }
                 }
             }
             Some(order)
@@ -70,8 +103,8 @@ impl Orderbook {
         self.orders.get(&order_id)
     }
 
-    /// Get all order IDs at a specific price tick
-    pub fn get_order_ids_at_tick(&self, tick: u64) -> Option<&OrderList> {
+    /// Get tick data at a specific price tick
+    pub fn get_tick_data(&self, tick: u64) -> Option<&Tick> {
         self.ticks.get(&tick)
     }
 
@@ -79,9 +112,10 @@ impl Orderbook {
     pub fn get_orders_at_tick(&self, tick: u64) -> Vec<&Order> {
         self.ticks
             .get(&tick)
-            .map(|order_entries| {
-                order_entries.iter()
-                    .filter_map(|(id, _)| self.orders.get(id))
+            .map(|tick_data| {
+                tick_data.buy_list.iter()
+                    .chain(tick_data.sell_list.iter())
+                    .filter_map(|&id| self.orders.get(&id))
                     .collect()
             })
             .unwrap_or_default()
@@ -91,10 +125,9 @@ impl Orderbook {
     pub fn get_buy_orders(&self) -> Vec<&Order> {
         self.ticks
             .values()
-            .flat_map(|order_entries| {
-                order_entries.iter()
-                    .filter(|(_, is_buy)| *is_buy)
-                    .filter_map(|(id, _)| self.orders.get(id))
+            .flat_map(|tick_data| {
+                tick_data.buy_list.iter()
+                    .filter_map(|&id| self.orders.get(&id))
             })
             .collect()
     }
@@ -103,10 +136,9 @@ impl Orderbook {
     pub fn get_sell_orders(&self) -> Vec<&Order> {
         self.ticks
             .values()
-            .flat_map(|order_entries| {
-                order_entries.iter()
-                    .filter(|(_, is_buy)| !*is_buy)
-                    .filter_map(|(id, _)| self.orders.get(id))
+            .flat_map(|tick_data| {
+                tick_data.sell_list.iter()
+                    .filter_map(|&id| self.orders.get(&id))
             })
             .collect()
     }
@@ -116,9 +148,7 @@ impl Orderbook {
         // Since IndexMap doesn't guarantee price ordering, we need to find the max price
         self.ticks
             .iter()
-            .filter(|(_, order_entries)| {
-                order_entries.iter().any(|(_, is_buy)| *is_buy)
-            })
+            .filter(|(_, tick_data)| !tick_data.buy_list.is_empty())
             .map(|(tick, _)| *tick)
             .max()
     }
@@ -128,9 +158,7 @@ impl Orderbook {
         // Since IndexMap doesn't guarantee price ordering, we need to find the min price
         self.ticks
             .iter()
-            .filter(|(_, order_entries)| {
-                order_entries.iter().any(|(_, is_buy)| !*is_buy)
-            })
+            .filter(|(_, tick_data)| !tick_data.sell_list.is_empty())
             .map(|(tick, _)| *tick)
             .min()
     }
@@ -139,10 +167,9 @@ impl Orderbook {
     pub fn get_buy_volume_at_tick(&self, tick: u64) -> u128 {
         self.ticks
             .get(&tick)
-            .map(|order_entries| {
-                order_entries.iter()
-                    .filter(|(_, is_buy)| *is_buy)
-                    .filter_map(|(id, _)| self.orders.get(id))
+            .map(|tick_data| {
+                tick_data.buy_list.iter()
+                    .filter_map(|&id| self.orders.get(&id))
                     .map(|order| order.amount)
                     .sum()
             })
@@ -153,10 +180,9 @@ impl Orderbook {
     pub fn get_sell_volume_at_tick(&self, tick: u64) -> u128 {
         self.ticks
             .get(&tick)
-            .map(|order_entries| {
-                order_entries.iter()
-                    .filter(|(_, is_buy)| !*is_buy)
-                    .filter_map(|(id, _)| self.orders.get(id))
+            .map(|tick_data| {
+                tick_data.sell_list.iter()
+                    .filter_map(|&id| self.orders.get(&id))
                     .map(|order| order.amount)
                     .sum()
             })
@@ -166,14 +192,18 @@ impl Orderbook {
     /// Remove empty tick entries to keep the orderbook clean
     /// We could run this on like every block or every 10 blocks or something
     pub fn cleanup_empty_ticks(&mut self) {
-        self.ticks.retain(|_, order_ids| !order_ids.is_empty());
+        self.ticks.retain(|_, tick_data| {
+            !tick_data.buy_list.is_empty() || !tick_data.sell_list.is_empty()
+        });
     }
 
     /// Get all price ticks that have orders, in insertion order
     pub fn get_active_ticks(&self) -> Vec<u64> {
         self.ticks
             .iter()
-            .filter(|(_, order_ids)| !order_ids.is_empty())
+            .filter(|(_, tick_data)| {
+                !tick_data.buy_list.is_empty() || !tick_data.sell_list.is_empty()
+            })
             .map(|(tick, _)| *tick)
             .collect()
     }
@@ -192,17 +222,19 @@ impl Orderbook {
 
     /// Get the total number of active price ticks
     pub fn active_tick_count(&self) -> usize {
-        self.ticks.values().filter(|orders| !orders.is_empty()).count()
+        self.ticks.values().filter(|tick_data| {
+            !tick_data.buy_list.is_empty() || !tick_data.sell_list.is_empty()
+        }).count()
     }
 }
 
 pub type OrderbookAddr = [u8; 32];
 
 /// Generate the orderbook address using Sha3(buy_asset || sell_asset || "spot_orderbook")
-pub fn derive_orderbook_addr(buy_asset: &str, sell_asset: &str) -> OrderbookAddr {
+pub fn derive_orderbook_addr(buy_asset: &[u8; 32], sell_asset: &[u8; 32]) -> OrderbookAddr {
     let mut hasher = Sha3_256::new();
-    hasher.update(buy_asset.as_bytes());
-    hasher.update(sell_asset.as_bytes());
+    hasher.update(buy_asset);
+    hasher.update(sell_asset);
     hasher.update(b"spot_orderbook");
     let digest = hasher.finalize();
     let mut out = [0u8; 32];

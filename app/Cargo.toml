@@ -36,3 +36,4 @@ tracing = "0.1.41"
 blake2 = "0.10"
 bcs = "0.1"
 indexmap = { version = "2.0", features = ["serde"] }
+deterministic-bloom = "0.1"

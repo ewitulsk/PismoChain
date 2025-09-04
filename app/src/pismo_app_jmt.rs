@@ -26,7 +26,7 @@ use hotstuff_rs::{
 
 // No direct use of Sui PublicKey needed for verification path now
 
-use crate::transactions::Transaction;
+use crate::{standards::book_executor::BookExecutor, transactions::Transaction};
 use crate::transactions::onramp::build_onramp_updates;
 use crate::config::Config;
 use crate::jmt_state::{make_state_key, make_key_hash_from_parts, get_jmt_root, get_jmt_value, compute_jmt_updates, get_with_proof};
@@ -37,6 +37,7 @@ use crate::transactions::accounts::{build_create_account_updates, build_link_acc
 use crate::transactions::noop::build_noop_updates;
 use crate::transactions::coin::{build_new_coin_updates, build_mint_updates, build_transfer_updates};
 use crate::transactions::orderbook::{build_create_orderbook_updates, build_new_limit_order_updates};
+use crate::transactions::book_executor::build_executor_updates;
  
 
 /// Counter-specific transaction operations that can be performed
@@ -153,15 +154,17 @@ pub struct PismoAppJMT {
     tx_queue: Arc<Mutex<Vec<PismoTransaction>>>,
     config: Config,
     next_version: u64, // JMT version counter - increments with each transaction
+    book_executor: BookExecutor, // Orderbook tracking
 }
 
 impl PismoAppJMT {
     /// Create a new JMT-enhanced counter app
-    pub fn new(tx_queue: Arc<Mutex<Vec<PismoTransaction>>>, config: Config) -> Self {
+    pub fn new(tx_queue: Arc<Mutex<Vec<PismoTransaction>>>, config: Config, book_executor: BookExecutor) -> Self {
         Self {
             tx_queue,
             config,
             next_version: 1, // Start at version 1, initialization handled by HotStuff
+            book_executor,
         }
     }
 
@@ -354,6 +357,8 @@ impl<K: KVStore> App<K> for PismoAppJMT {
             println!("❌ Block validation failed: Could not deserialize block payload");
             ValidateBlockResponse::Invalid
         }
+
+        
     }
 }
 
@@ -483,6 +488,7 @@ impl PismoAppJMT {
                         signer_type,
                         signature_type,
                         block_tree,
+                        self.book_executor.clone(),
                         version
                     );
                     jmt_writes.extend(writes);
@@ -499,6 +505,7 @@ impl PismoAppJMT {
                         signer_type,
                         signature_type,
                         block_tree,
+                        self.book_executor.clone(),
                         version
                     );
                     jmt_writes.extend(writes);
@@ -506,6 +513,11 @@ impl PismoAppJMT {
                 }
             }
         }
+
+        // Process orderbook execution after all transactions have been processed
+        let (executor_writes, executor_mirrors) = build_executor_updates(&self.book_executor, block_tree, version);
+        jmt_writes.extend(executor_writes);
+        app_mirror_inserts.extend(executor_mirrors);
 
         // Prepare JMT writes using proper KeyHash and OwnedValue types
         // No-op for counter state now

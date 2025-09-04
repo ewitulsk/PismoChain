@@ -50,7 +50,7 @@ use std::{
     collections::HashMap,
 };
 
-use crate::jmt_state::{make_key_hash_from_parts, DirectJMTReader};
+use crate::{jmt_state::{make_key_hash_from_parts, DirectJMTReader}, standards::book_executor::BookExecutor};
 use jmt::JellyfishMerkleTree;
 
  
@@ -154,7 +154,11 @@ async fn main() {
 
     // Create transaction queue for the counter app
     let tx_queue = Arc::new(Mutex::new(Vec::new()));
-    let pismo_app = PismoAppJMT::new(tx_queue.clone(), config.clone());
+    
+    // Create the BookExecutor for orderbook tracking
+    let book_executor = BookExecutor::new();
+    
+    let pismo_app = PismoAppJMT::new(tx_queue.clone(), config.clone(), book_executor);
 
     // Configure the replica with faster view times
     let configuration = Configuration::builder()
@@ -379,8 +383,27 @@ async fn main() {
                         Err(e) => return Err(ErrorObjectOwned::owned(-32001, "Failed to query JMT", Some(e.to_string()))),
                     }
                 }
+                "Orderbook" => {
+                    // Create JMT key hash for orderbook
+                    let key_hash = make_key_hash_from_parts(address, b"orderbook");
+                    
+                    match tree.get(key_hash, version) {
+                        Ok(Some(bytes)) => {
+                            // Import Orderbook type
+                            use crate::standards::orderbook::Orderbook;
+                            match <Orderbook as borsh::BorshDeserialize>::try_from_slice(&bytes) {
+                                Ok(orderbook) => serde_json::to_value(&orderbook).map_err(|e| {
+                                    ErrorObjectOwned::owned(-32001, "Failed to serialize Orderbook", Some(e.to_string()))
+                                })?,
+                                Err(e) => return Err(ErrorObjectOwned::owned(-32001, "Failed to deserialize Orderbook", Some(e.to_string()))),
+                            }
+                        }
+                        Ok(None) => Value::Null,
+                        Err(e) => return Err(ErrorObjectOwned::owned(-32001, "Failed to query JMT", Some(e.to_string()))),
+                    }
+                }
                 _ => {
-                    return Err(ErrorObjectOwned::owned(-32602, "Unsupported type. Use: Account, Coin, CoinStore, or Link", None::<String>));
+                    return Err(ErrorObjectOwned::owned(-32602, "Unsupported type. Use: Account, Coin, CoinStore, Link, or Orderbook", None::<String>));
                 }
             };
 

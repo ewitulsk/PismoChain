@@ -6,6 +6,7 @@ use crate::jmt_state::make_key_hash_from_parts;
 use crate::standards::accounts::{
     get_account_from_signer, make_account_object_key,
 };
+use crate::standards::book_executor::BookExecutor;
 use crate::standards::orderbook::{
     Order, Orderbook, derive_orderbook_addr, 
     make_orderbook_object_key, get_orderbook, generate_order_id,
@@ -21,6 +22,7 @@ pub fn build_create_orderbook_updates<K: KVStore>(
     signer_type: SignerType,
     signature_type: SignatureType,
     block_tree: &AppBlockTreeView<'_, K>,
+    book_executor: BookExecutor,
     _version: u64,
 ) -> (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>) {
     let mut jmt_writes: Vec<(KeyHash, Option<OwnedValue>)> = Vec::new();
@@ -38,17 +40,52 @@ pub fn build_create_orderbook_updates<K: KVStore>(
         mirror.push((make_account_object_key(&account_addr), account_bytes));
     }
 
+    // Convert hex strings to byte arrays
+    let buy_asset_bytes = hex::decode(&buy_asset)
+        .map_err(|e| println!("❌ Invalid buy_asset hex: {}", e))
+        .and_then(|bytes| {
+            if bytes.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                Ok(arr)
+            } else {
+                println!("❌ buy_asset must be 32 bytes");
+                Err(())
+            }
+        });
+
+    let sell_asset_bytes = hex::decode(&sell_asset)
+        .map_err(|e| println!("❌ Invalid sell_asset hex: {}", e))
+        .and_then(|bytes| {
+            if bytes.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                Ok(arr)
+            } else {
+                println!("❌ sell_asset must be 32 bytes");
+                Err(())
+            }
+        });
+
+    let (buy_asset_addr, sell_asset_addr) = match (buy_asset_bytes, sell_asset_bytes) {
+        (Ok(buy), Ok(sell)) => (buy, sell),
+        _ => {
+            println!("❌ Failed to parse asset addresses");
+            return (vec![], vec![]);
+        }
+    };
+
     // Derive the orderbook address
-    let orderbook_addr = derive_orderbook_addr(&buy_asset, &sell_asset);
+    let orderbook_addr = derive_orderbook_addr(&buy_asset_addr, &sell_asset_addr);
 
     // Check if orderbook already exists
     if get_orderbook(block_tree, &orderbook_addr).is_some() {
-        println!("❌ Orderbook already exists for {}/{}", buy_asset, sell_asset);
+        println!("❌ Orderbook already exists for {:?}/{:?}", hex::encode(&buy_asset_addr[..8]), hex::encode(&sell_asset_addr[..8]));
         return (vec![], vec![]);
     }
 
     // Create the orderbook object
-    let orderbook = Orderbook::new(buy_asset.clone(), sell_asset.clone());
+    let orderbook = Orderbook::new(buy_asset_addr, sell_asset_addr);
 
     // Serialize the orderbook
     let orderbook_bytes = <Orderbook as borsh::BorshSerialize>::try_to_vec(&orderbook).unwrap();
@@ -61,7 +98,10 @@ pub fn build_create_orderbook_updates<K: KVStore>(
     let orderbook_object_key = make_orderbook_object_key(&orderbook_addr);
     mirror.push((orderbook_object_key, orderbook_bytes));
 
-    println!("✅ Created orderbook for {}/{} at address: {:?}", buy_asset, sell_asset, hex::encode(&orderbook_addr[..8]));
+    // Add orderbook to the BookExecutor for tracking
+    book_executor.add_orderbook(&orderbook_addr);
+
+    println!("✅ Created orderbook for {:?}/{:?} at address: {:?}", hex::encode(&buy_asset_addr[..8]), hex::encode(&sell_asset_addr[..8]), hex::encode(&orderbook_addr[..8]));
     
     (jmt_writes, mirror)
 }
@@ -77,6 +117,7 @@ pub fn build_new_limit_order_updates<K: KVStore>(
     signer_type: SignerType,
     signature_type: SignatureType,
     block_tree: &AppBlockTreeView<'_, K>,
+    book_executor: BookExecutor,
     _version: u64,
 ) -> (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>) {
     let mut jmt_writes: Vec<(KeyHash, Option<OwnedValue>)> = Vec::new();
@@ -98,10 +139,14 @@ pub fn build_new_limit_order_updates<K: KVStore>(
             is_buy,
             order_id,
             amount,
+            account: account_addr,
         };
 
         // Add the order to the orderbook at the specified tick price
         orderbook.add_order(tick_price, order);
+
+        // Mark orderbook as changed in the BookExecutor
+        book_executor.mark_orderbook_changed(&orderbook_address);
 
         // Serialize and store the updated orderbook
         let orderbook_bytes = <Orderbook as borsh::BorshSerialize>::try_to_vec(&orderbook).unwrap();
