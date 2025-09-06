@@ -17,6 +17,100 @@ use hotstuff_rs::{
     block_tree::pluggables::KVStore,
 };
 use sha3::{Digest, Sha3_256};
+use std::collections::HashMap;
+
+/// Trait for reading state values from either committed state or pending overlay
+pub trait StateReader {
+    /// Get a JMT value for a specific key hash
+    fn get_jmt_value(&self, key_hash: KeyHash, version: Version) -> Result<Option<OwnedValue>>;
+    
+    /// Get an app-level mirror value for a specific key
+    fn get_mirror_value(&self, key: &[u8]) -> Option<Vec<u8>>;
+}
+
+/// Implementation of StateReader for committed state via AppBlockTreeView
+impl<K: KVStore> StateReader for AppBlockTreeView<'_, K> {
+    fn get_jmt_value(&self, key_hash: KeyHash, version: Version) -> Result<Option<OwnedValue>> {
+        get_jmt_value(self, key_hash, version)
+    }
+    
+    fn get_mirror_value(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.app_state(key)
+    }
+}
+
+/// Pending block state overlay that accumulates changes during block execution
+pub struct PendingBlockState<'a, K: KVStore> {
+    /// Reference to committed state
+    pub block_tree: &'a AppBlockTreeView<'a, K>,
+    
+    /// Pending JMT updates (key_hash -> value)
+    pub jmt_overlay: HashMap<KeyHash, Option<OwnedValue>>,
+    
+    /// Pending app mirror updates (for non-JMT keys)
+    pub mirror_overlay: HashMap<Vec<u8>, Vec<u8>>,
+    
+    /// Current version for this block execution
+    pub version: Version,
+}
+
+impl<'a, K: KVStore> PendingBlockState<'a, K> {
+    /// Create a new pending state overlay
+    pub fn new(block_tree: &'a AppBlockTreeView<'a, K>, version: Version) -> Self {
+        Self {
+            block_tree,
+            jmt_overlay: HashMap::new(),
+            mirror_overlay: HashMap::new(),
+            version,
+        }
+    }
+    
+    /// Apply JMT writes to the overlay
+    pub fn apply_jmt_writes(&mut self, writes: Vec<(KeyHash, Option<OwnedValue>)>) {
+        for (key_hash, value) in writes {
+            self.jmt_overlay.insert(key_hash, value);
+        }
+    }
+    
+    /// Apply mirror inserts to the overlay
+    pub fn apply_mirror_inserts(&mut self, inserts: Vec<(Vec<u8>, Vec<u8>)>) {
+        for (key, value) in inserts {
+            self.mirror_overlay.insert(key, value);
+        }
+    }
+    
+    /// Extract all accumulated JMT writes for final JMT computation
+    pub fn extract_jmt_writes(self) -> Vec<(KeyHash, Option<OwnedValue>)> {
+        self.jmt_overlay.into_iter().collect()
+    }
+    
+    /// Extract all accumulated mirror inserts for app state updates
+    pub fn extract_mirror_inserts(self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.mirror_overlay.into_iter().collect()
+    }
+}
+
+impl<'a, K: KVStore> StateReader for PendingBlockState<'a, K> {
+    fn get_jmt_value(&self, key_hash: KeyHash, version: Version) -> Result<Option<OwnedValue>> {
+        // Check overlay first
+        if let Some(value) = self.jmt_overlay.get(&key_hash) {
+            return Ok(value.clone());
+        }
+        
+        // Fall back to committed state
+        self.block_tree.get_jmt_value(key_hash, version)
+    }
+    
+    fn get_mirror_value(&self, key: &[u8]) -> Option<Vec<u8>> {
+        // Check overlay first
+        if let Some(value) = self.mirror_overlay.get(key) {
+            return Some(value.clone());
+        }
+        
+        // Fall back to committed state
+        self.block_tree.get_mirror_value(key)
+    }
+}
 
 /// Creates a 32-byte state key from owner address and struct tag
 pub fn make_state_key(addr: [u8; 32], struct_tag: &[u8]) -> [u8; 32] {

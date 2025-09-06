@@ -2,14 +2,14 @@ use hotstuff_rs::block_tree::accessors::app::AppBlockTreeView;
 use hotstuff_rs::block_tree::pluggables::KVStore;
 use jmt::{KeyHash, OwnedValue};
 
-use crate::jmt_state::make_key_hash_from_parts;
-use crate::standards::accounts::get_account;
+use crate::jmt_state::{make_key_hash_from_parts, StateReader};
+use crate::standards::accounts::{get_account, get_account_from_state};
 use crate::standards::book_executor::BookExecutor;
 use crate::standards::orderbook::{
-    Order, Orderbook, get_orderbook, make_orderbook_object_key,
+    Order, Orderbook, get_orderbook, get_orderbook_from_state, make_orderbook_object_key,
 };
 use crate::standards::coin::{
-    derive_coin_store_addr, get_coin_store, make_coin_store_object_key, CoinStore,
+    derive_coin_store_addr, get_coin_store, get_coin_store_from_state, make_coin_store_object_key, CoinStore,
 };
 
 /// Result of order execution indicating remaining orders after partial fills
@@ -23,13 +23,13 @@ pub struct ExecutionRes {
 
 /// Build writes and app-mirror inserts for executing a trade between two orders
 /// Handles partial fills and returns any remaining orders
-pub fn build_execution_updates<K: KVStore>(
+pub fn build_execution_updates(
     buy_asset_addr: [u8; 32],
     sell_asset_addr: [u8; 32],
     mut buy_order: Order,
     mut sell_order: Order,
     execution_price: u64,
-    block_tree: &AppBlockTreeView<'_, K>,
+    state: &impl StateReader,
     _version: u64,
 ) -> (ExecutionRes, Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>) {
     let mut jmt_writes: Vec<(KeyHash, Option<OwnedValue>)> = Vec::new();
@@ -43,8 +43,8 @@ pub fn build_execution_updates<K: KVStore>(
 
     // Get both accounts
     let (buyer_account_opt, seller_account_opt) = (
-        get_account(block_tree, &buy_order.account),
-        get_account(block_tree, &sell_order.account),
+        get_account_from_state(state, &buy_order.account),
+        get_account_from_state(state, &sell_order.account),
     );
 
     if let (Some(buyer_account), Some(seller_account)) = (buyer_account_opt, seller_account_opt) {
@@ -58,10 +58,13 @@ pub fn build_execution_updates<K: KVStore>(
         let seller_buy_store_addr = derive_coin_store_addr(&seller_account.account_addr, &buy_asset_addr);
         let seller_sell_store_addr = derive_coin_store_addr(&seller_account.account_addr, &sell_asset_addr);
 
+        println!("Buy Store Addr {:?}", buyer_buy_store_addr);
+        println!("Sell Store Addr {:?}", seller_sell_store_addr);
+
         // Check if buyer has sufficient buy_asset (to pay) and seller has sufficient sell_asset
         if let (Some(mut buyer_buy_store), Some(mut seller_sell_store)) = (
-            get_coin_store(block_tree, &buyer_buy_store_addr),
-            get_coin_store(block_tree, &seller_sell_store_addr),
+            get_coin_store_from_state(state, &buyer_buy_store_addr),
+            get_coin_store_from_state(state, &seller_sell_store_addr),
         ) {
             if buyer_buy_store.amount >= total_price && seller_sell_store.amount >= execution_amount {
                 // Execute the trade
@@ -69,7 +72,7 @@ pub fn build_execution_updates<K: KVStore>(
                 // Buyer: pay total_price of buy_asset, receive execution_amount of sell_asset
                 buyer_buy_store.amount = buyer_buy_store.amount.saturating_sub(total_price);
                 
-                let buyer_sell_store = if let Some(mut existing) = get_coin_store(block_tree, &buyer_sell_store_addr) {
+                let buyer_sell_store = if let Some(mut existing) = get_coin_store_from_state(state, &buyer_sell_store_addr) {
                     existing.amount = existing.amount.saturating_add(execution_amount);
                     existing
                 } else {
@@ -79,7 +82,7 @@ pub fn build_execution_updates<K: KVStore>(
                 // Seller: receive total_price of buy_asset, pay execution_amount of sell_asset
                 seller_sell_store.amount = seller_sell_store.amount.saturating_sub(execution_amount);
                 
-                let seller_buy_store = if let Some(mut existing) = get_coin_store(block_tree, &seller_buy_store_addr) {
+                let seller_buy_store = if let Some(mut existing) = get_coin_store_from_state(state, &seller_buy_store_addr) {
                     existing.amount = existing.amount.saturating_add(total_price);
                     existing
                 } else {
@@ -132,9 +135,9 @@ pub fn build_execution_updates<K: KVStore>(
 
 /// Build writes and app-mirror inserts for processing all changed orderbooks
 /// This function implements the orderbook matching engine
-pub fn build_executor_updates<K: KVStore>(
+pub fn build_executor_updates(
     book_executor: &BookExecutor,
-    block_tree: &AppBlockTreeView<'_, K>,
+    state: &impl StateReader,
     version: u64,
 ) -> (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>) {
     let mut jmt_writes: Vec<(KeyHash, Option<OwnedValue>)> = Vec::new();
@@ -142,11 +145,16 @@ pub fn build_executor_updates<K: KVStore>(
 
     // Get all orderbook addresses that need processing
     let orderbook_addresses = book_executor.get_orderbook_addresses();
+
+    println!("Orderbook Addresses: {:?}", orderbook_addresses);
     
     for orderbook_addr in orderbook_addresses {
-        if let Some(mut orderbook) = get_orderbook(block_tree, &orderbook_addr) {
+        println!("Processing...");
+        if let Some(mut orderbook) = get_orderbook_from_state(state, &orderbook_addr) {
             // Get all ticks sorted by price (lowest to highest)
             let sorted_ticks = orderbook.get_active_ticks_sorted();
+
+            println!("Sorted Ticks: {:?}", sorted_ticks);
             
             let mut lowest_buy_tick: Option<u64> = None;
             let mut lowest_sell_tick: Option<u64> = None;
@@ -189,7 +197,7 @@ pub fn build_executor_updates<K: KVStore>(
                                 buy_order,
                                 sell_order,
                                 tick,
-                                block_tree,
+                                state,
                                 version,
                             );
                             

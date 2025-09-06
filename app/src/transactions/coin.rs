@@ -1,21 +1,19 @@
 use std::vec;
-
-use hotstuff_rs::block_tree::accessors::app::AppBlockTreeView;
-use hotstuff_rs::block_tree::pluggables::KVStore;
 use jmt::{KeyHash, OwnedValue};
 
-use crate::jmt_state::make_key_hash_from_parts;
+use crate::jmt_state::{make_key_hash_from_parts, StateReader};
 use crate::standards::accounts::{
-    get_account_from_signer, make_account_object_key, derive_account_addr,
+    get_account_from_signer_state, make_account_object_key, derive_account_addr,
 };
 use crate::standards::coin::{
     Coin, CoinStore, derive_coin_addr, make_coin_object_key,
-    derive_coin_store_addr, make_coin_store_object_key, get_coin, get_coin_store,
+    derive_coin_store_addr, make_coin_store_object_key,
+    get_coin_from_state, get_coin_store_from_state,
 };
 use crate::transactions::{SignerType, SignatureType};
 
 /// Build writes and app-mirror inserts for creating a new token
-pub fn build_new_coin_updates<K: KVStore>(
+pub fn build_new_coin_updates(
     name: String,
     project_uri: String,
     logo_uri: String,
@@ -26,7 +24,7 @@ pub fn build_new_coin_updates<K: KVStore>(
     signer_address: &str,
     signer_type: SignerType,
     signature_type: SignatureType,
-    block_tree: &AppBlockTreeView<'_, K>,
+    state: &impl StateReader,
     _version: u64,
 ) -> (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>) {
     let mut jmt_writes: Vec<(KeyHash, Option<OwnedValue>)> = Vec::new();
@@ -60,7 +58,7 @@ pub fn build_new_coin_updates<K: KVStore>(
     mirror.push((coin_object_key, coin_bytes));
 
     // If we have an existing account, increment its nonce
-    if let Some(mut account) = get_account_from_signer(block_tree, &signer_address.to_string(), signer_type, signature_type, &signing_pub_key) {
+    if let Some(mut account) = get_account_from_signer_state(state, &signer_address.to_string(), signer_type, signature_type, &signing_pub_key) {
         let account_addr = account.account_addr;
         account.increment_nonce();
         
@@ -75,7 +73,7 @@ pub fn build_new_coin_updates<K: KVStore>(
 }
 
 /// Build writes and app-mirror inserts for minting tokens
-pub fn build_mint_updates<K: KVStore>(
+pub fn build_mint_updates(
     coin_addr: [u8; 32],
     account_addr: [u8; 32],
     amount: u128,
@@ -83,7 +81,7 @@ pub fn build_mint_updates<K: KVStore>(
     signer_address: &str,
     signer_type: SignerType,
     signature_type: SignatureType,
-    block_tree: &AppBlockTreeView<'_, K>,
+    state: &impl StateReader,
     _version: u64,
 ) -> (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>) {
     let mut jmt_writes: Vec<(KeyHash, Option<OwnedValue>)> = Vec::new();
@@ -91,8 +89,8 @@ pub fn build_mint_updates<K: KVStore>(
 
     // Check both coin and account existence at the start
     if let (Some(mut coin), Some(mut account)) = (
-        get_coin(block_tree, &coin_addr),
-        get_account_from_signer(block_tree, &signer_address.to_string(), signer_type, signature_type, &signing_pub_key)
+        get_coin_from_state(state, &coin_addr),
+        get_account_from_signer_state(state, &signer_address.to_string(), signer_type, signature_type, &signing_pub_key)
     ) {
         // Increment the account nonce
         let account_addr_local = account.account_addr;
@@ -114,7 +112,7 @@ pub fn build_mint_updates<K: KVStore>(
         let coin_store_addr = derive_coin_store_addr(&account_addr, &coin_addr);
         
         // Check if coin store exists, create or update it
-        let coin_store = if let Some(mut existing_store) = get_coin_store(block_tree, &coin_store_addr) {
+        let coin_store = if let Some(mut existing_store) = get_coin_store_from_state(state, &coin_store_addr) {
             // Store exists, increment the amount
             existing_store.amount = existing_store.amount.saturating_add(amount);
             existing_store
@@ -147,7 +145,7 @@ pub fn build_mint_updates<K: KVStore>(
 }
 
 /// Build writes and app-mirror inserts for transferring tokens between accounts
-pub fn build_transfer_updates<K: KVStore>(
+pub fn build_transfer_updates(
     coin_addr: [u8; 32],
     receiver_addr: [u8; 32],
     amount: u128,
@@ -155,7 +153,7 @@ pub fn build_transfer_updates<K: KVStore>(
     signer_address: &str,
     signer_type: SignerType,
     signature_type: SignatureType,
-    block_tree: &AppBlockTreeView<'_, K>,
+    state: &impl StateReader,
     _version: u64,
 ) -> (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>) {
     let mut jmt_writes: Vec<(KeyHash, Option<OwnedValue>)> = Vec::new();
@@ -163,8 +161,8 @@ pub fn build_transfer_updates<K: KVStore>(
 
     // Check both coin and sender account existence at the start
     if let (Some(_coin), Some(mut sender_account)) = (
-        get_coin(block_tree, &coin_addr),
-        get_account_from_signer(block_tree, &signer_address.to_string(), signer_type, signature_type, &signing_pub_key)
+        get_coin_from_state(state, &coin_addr),
+        get_account_from_signer_state(state, &signer_address.to_string(), signer_type, signature_type, &signing_pub_key)
     ) {
         // Derive sender's account address from their signing public key (CRITICAL SECURITY RULE)
         let sender_account_addr = sender_account.account_addr;
@@ -177,14 +175,14 @@ pub fn build_transfer_updates<K: KVStore>(
         let receiver_store_addr = derive_coin_store_addr(&receiver_addr, &coin_addr);
         
         // Check sender's coin store and balance
-        if let Some(mut sender_store) = get_coin_store(block_tree, &sender_store_addr) {
+        if let Some(mut sender_store) = get_coin_store_from_state(state, &sender_store_addr) {
             // Check if sender has sufficient balance
             if sender_store.amount >= amount {
                 // Deduct amount from sender's coin store
                 sender_store.amount = sender_store.amount.saturating_sub(amount);
                 
                 // Handle receiver's coin store
-                let receiver_store = if let Some(mut existing_store) = get_coin_store(block_tree, &receiver_store_addr) {
+                let receiver_store = if let Some(mut existing_store) = get_coin_store_from_state(state, &receiver_store_addr) {
                     // Receiver has existing store, increment the amount
                     existing_store.amount = existing_store.amount.saturating_add(amount);
                     existing_store

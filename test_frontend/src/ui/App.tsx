@@ -116,6 +116,12 @@ export default function App() {
   const [limitOrderIsBuy, setLimitOrderIsBuy] = useState<boolean>(true)
   const [limitOrderAmount, setLimitOrderAmount] = useState<string>('1000')
   const [limitOrderTickPrice, setLimitOrderTickPrice] = useState<string>('100')
+  
+  // Token management state
+  const [tokenAddresses, setTokenAddresses] = useState<string[]>([])
+  const [newTokenAddress, setNewTokenAddress] = useState<string>('')
+  const [tokenBalances, setTokenBalances] = useState<Record<string, { balance: string | null, coinStoreAddress: string }>>({})
+  const [isQueryingBalances, setIsQueryingBalances] = useState<boolean>(false)
 
   const signerStr = useMemo(() => pubkeyBase58 ? exampleSignerString(pubkeyBase58) : '', [pubkeyBase58])
 
@@ -799,8 +805,96 @@ export default function App() {
     setOrderbookSellAsset('')
     setCreatedOrderbookAddress('')
     setLimitOrderOrderbookAddress('')
+    // Clear token management state
+    setTokenAddresses([])
+    setNewTokenAddress('')
+    setTokenBalances({})
     setStatus('Wallet disconnected')
   }, [])
+
+  // Token management functions
+  const addTokenAddress = useCallback(() => {
+    if (!newTokenAddress.trim()) return
+    
+    // Validate hex address format
+    if (newTokenAddress.trim().length !== 64) {
+      setStatus('Token address must be 64 hex characters')
+      return
+    }
+    
+    // Check if already added
+    if (tokenAddresses.includes(newTokenAddress.trim())) {
+      setStatus('Token address already added')
+      return
+    }
+    
+    setTokenAddresses(prev => [...prev, newTokenAddress.trim()])
+    setNewTokenAddress('')
+    setStatus('Token address added')
+  }, [newTokenAddress, tokenAddresses])
+
+  const removeTokenAddress = useCallback((addressToRemove: string) => {
+    setTokenAddresses(prev => prev.filter(addr => addr !== addressToRemove))
+    setTokenBalances(prev => {
+      const newBalances = { ...prev }
+      delete newBalances[addressToRemove]
+      return newBalances
+    })
+    setStatus('Token address removed')
+  }, [])
+
+  const queryAllBalances = useCallback(async () => {
+    if (!currentWallet) {
+      setStatus('Connect a wallet first')
+      return
+    }
+    
+    if (tokenAddresses.length === 0) {
+      setStatus('No token addresses added')
+      return
+    }
+
+    setIsQueryingBalances(true)
+    setStatus('Querying token balances...')
+    
+    try {
+      // Derive user's account address
+      const accountAddr = deriveAccountAddr(1, currentWallet.signatureType, currentWallet.publicKeyHex)
+      
+      const balanceResults: Record<string, { balance: string | null, coinStoreAddress: string }> = {}
+      
+      // Query each token's coinstore
+      for (const tokenAddr of tokenAddresses) {
+        try {
+          const coinAddrBytes = new Uint8Array(tokenAddr.match(/.{2}/g)!.map(hex => parseInt(hex, 16)))
+          const coinStoreAddr = deriveCoinStoreAddr(accountAddr, coinAddrBytes)
+          const coinStoreHex = Array.from(coinStoreAddr).map(b => b.toString(16).padStart(2, '0')).join('')
+          
+          // Query the coinstore
+          const result = await viewQuery(coinStoreHex, 'CoinStore')
+          
+          balanceResults[tokenAddr] = {
+            balance: result?.amount?.toString() ?? null, // null means coinstore doesn't exist (0 balance)
+            coinStoreAddress: coinStoreHex
+          }
+        } catch (e) {
+          console.warn(`Failed to query balance for token ${tokenAddr}:`, e)
+          balanceResults[tokenAddr] = {
+            balance: null, // Treat as 0 balance
+            coinStoreAddress: 'unknown'
+          }
+        }
+      }
+      
+      setTokenBalances(balanceResults)
+      setStatus(`Queried balances for ${tokenAddresses.length} tokens`)
+    } catch (e: any) {
+      console.error('Failed to query balances:', e)
+      setStatus(`Error querying balances: ${e?.message || e}`)
+    } finally {
+      setIsQueryingBalances(false)
+    }
+  }, [currentWallet, tokenAddresses])
 
 
 
@@ -913,7 +1007,7 @@ export default function App() {
 
       <hr style={{ margin: '24px 0' }} />
 
-      <h2>Wallet-Agnostic Token Operations</h2>
+      <h2>Token Operations</h2>
       <div style={{ marginBottom: 16 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
           <div><strong>Active Wallet:</strong> {currentWallet ? `${currentWallet.type} (${currentWallet.signer})` : 'None'}</div>
@@ -963,6 +1057,152 @@ export default function App() {
         <button onClick={onMint} disabled={!currentWallet || !coinAddress}>
           Mint Tokens
         </button>
+      </div>
+
+      {/* Token Management Section */}
+      <div style={{ marginBottom: 16, padding: 16, border: '1px solid #e1e5e9', borderRadius: 8, background: '#fafbfc' }}>
+        <h3 style={{ margin: '0 0 16px 0', fontSize: '16px' }}>Token Portfolio</h3>
+        
+        {/* Add Token Input */}
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 16 }}>
+          <label style={{ minWidth: '120px', fontSize: '14px' }}>Add Token:</label>
+          <input
+            type="text"
+            placeholder="Enter 64-character hex token address"
+            value={newTokenAddress}
+            onChange={(e) => setNewTokenAddress(e.target.value)}
+            style={{ flex: 1, padding: '6px 8px', border: '1px solid #ccc', borderRadius: 4, fontSize: '12px', fontFamily: 'monospace' }}
+          />
+          <button 
+            onClick={addTokenAddress}
+            disabled={!newTokenAddress.trim()}
+            style={{ 
+              padding: '6px 12px', 
+              backgroundColor: !newTokenAddress.trim() ? '#f0f0f0' : '#28a745', 
+              color: !newTokenAddress.trim() ? '#666' : 'white',
+              border: 'none', 
+              borderRadius: 4, 
+              cursor: !newTokenAddress.trim() ? 'not-allowed' : 'pointer',
+              fontSize: '14px'
+            }}
+          >
+            Add
+          </button>
+          {coinAddress && (
+            <button 
+              onClick={() => setNewTokenAddress(coinAddress)} 
+              style={{ padding: '6px 8px', fontSize: '12px', whiteSpace: 'nowrap' }}
+            >
+              Use My Coin
+            </button>
+          )}
+        </div>
+
+        {/* Query Balances Button */}
+        {tokenAddresses.length > 0 && (
+          <div style={{ marginBottom: 16 }}>
+            <button 
+              onClick={queryAllBalances}
+              disabled={!currentWallet || isQueryingBalances}
+              style={{ 
+                padding: '8px 16px', 
+                backgroundColor: !currentWallet || isQueryingBalances ? '#f0f0f0' : '#007bff', 
+                color: !currentWallet || isQueryingBalances ? '#666' : 'white',
+                border: 'none', 
+                borderRadius: 4, 
+                cursor: !currentWallet || isQueryingBalances ? 'not-allowed' : 'pointer',
+                fontSize: '14px'
+              }}
+            >
+              {isQueryingBalances ? 'Querying...' : `Query Balances (${tokenAddresses.length} tokens)`}
+            </button>
+          </div>
+        )}
+
+        {/* Token List */}
+        {tokenAddresses.length > 0 && (
+          <div>
+            <h4 style={{ margin: '0 0 12px 0', fontSize: '14px' }}>Your Tokens:</h4>
+            <div style={{ display: 'grid', gap: 8 }}>
+              {tokenAddresses.map((tokenAddr) => {
+                const tokenData = tokenBalances[tokenAddr]
+                const displayBalance = tokenData?.balance ?? '0'
+                const hasBalance = tokenData?.balance !== null
+                
+                return (
+                  <div key={tokenAddr} style={{ 
+                    display: 'flex', 
+                    alignItems: 'center', 
+                    gap: 8, 
+                    padding: 8, 
+                    border: '1px solid #ddd', 
+                    borderRadius: 4, 
+                    background: 'white',
+                    fontSize: '12px'
+                  }}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontFamily: 'monospace', marginBottom: 2 }}>
+                        <strong>Token:</strong> {tokenAddr}
+                      </div>
+                      <div style={{ 
+                        color: hasBalance ? '#28a745' : '#6c757d',
+                        fontWeight: hasBalance ? 'bold' : 'normal'
+                      }}>
+                        <strong>Balance:</strong> {displayBalance} {!hasBalance && '(no coinstore)'}
+                      </div>
+                      {tokenData?.coinStoreAddress && tokenData.coinStoreAddress !== 'unknown' && (
+                        <div style={{ fontFamily: 'monospace', fontSize: '11px', color: '#666' }}>
+                          <strong>CoinStore:</strong> {tokenData.coinStoreAddress}
+                        </div>
+                      )}
+                    </div>
+                    <div style={{ display: 'flex', gap: 4 }}>
+                      {tokenData?.coinStoreAddress && tokenData.coinStoreAddress !== 'unknown' && (
+                        <button 
+                          onClick={() => {
+                            setViewAddress(tokenData.coinStoreAddress)
+                            setViewType('CoinStore')
+                          }}
+                          style={{ 
+                            padding: '4px 6px', 
+                            fontSize: '11px', 
+                            backgroundColor: '#007bff',
+                            color: 'white',
+                            border: 'none',
+                            borderRadius: 3,
+                            cursor: 'pointer'
+                          }}
+                        >
+                          View
+                        </button>
+                      )}
+                      <button 
+                        onClick={() => removeTokenAddress(tokenAddr)}
+                        style={{ 
+                          padding: '4px 6px', 
+                          fontSize: '11px', 
+                          backgroundColor: '#dc3545',
+                          color: 'white',
+                          border: 'none',
+                          borderRadius: 3,
+                          cursor: 'pointer'
+                        }}
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        )}
+
+        {tokenAddresses.length === 0 && (
+          <div style={{ textAlign: 'center', color: '#666', fontSize: '14px', padding: 16 }}>
+            No tokens added yet. Add a token address above to track your balance.
+          </div>
+        )}
       </div>
 
       {/* Transfer Section */}

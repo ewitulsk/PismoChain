@@ -29,7 +29,7 @@ use hotstuff_rs::{
 use crate::{standards::book_executor::BookExecutor, transactions::Transaction};
 use crate::transactions::onramp::build_onramp_updates;
 use crate::config::Config;
-use crate::jmt_state::{make_state_key, make_key_hash_from_parts, get_jmt_root, get_jmt_value, compute_jmt_updates, get_with_proof};
+use crate::jmt_state::{make_state_key, make_key_hash_from_parts, get_jmt_root, get_jmt_value, compute_jmt_updates, get_with_proof, PendingBlockState};
 use hotstuff_rs::block_tree::pluggables::KVStore;
 use jmt::{KeyHash, RootHash, OwnedValue, proof::SparseMerkleProof};
 
@@ -371,9 +371,8 @@ impl PismoAppJMT {
         block_tree: &AppBlockTreeView<'_, K>,
         version: u64,
     ) -> (Option<AppStateUpdates>, RootHash) {
-        let user_modifications_in_block: HashMap<String, User> = HashMap::new();
-        let mut jmt_writes: Vec<(KeyHash, Option<OwnedValue>)> = Vec::new();
-        let mut app_mirror_inserts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        // Create pending state overlay for intra-block transaction visibility
+        let mut pending_state = PendingBlockState::new(block_tree, version);
 
         // Process transactions (business logic)
         for transaction in transactions {
@@ -412,24 +411,24 @@ impl PismoAppJMT {
             match &transaction.payload {
                 // Remove counter-only transactions per new requirements
                 PismoOperation::Onramp(vaa, guardian_set_index) => {
-                    let (writes, mirrors) = build_onramp_updates(vaa, *guardian_set_index, &self.config, block_tree, version);
-                    jmt_writes.extend(writes);
-                    app_mirror_inserts.extend(mirrors);
+                    let (writes, mirrors) = build_onramp_updates(vaa, *guardian_set_index, &self.config, &pending_state, version);
+                    pending_state.apply_jmt_writes(writes);
+                    pending_state.apply_mirror_inserts(mirrors);
                 }
                 PismoOperation::CreateAccount => {
-                    let (writes, mirrors) = build_create_account_updates(signature_type, signing_pub_key.clone(), signer_type, block_tree, version);
-                    jmt_writes.extend(writes);
-                    app_mirror_inserts.extend(mirrors);
+                    let (writes, mirrors) = build_create_account_updates(signature_type, signing_pub_key.clone(), signer_type, &pending_state, version);
+                    pending_state.apply_jmt_writes(writes);
+                    pending_state.apply_mirror_inserts(mirrors);
                 }
                 PismoOperation::LinkAccount { external_wallet } => {
-                    let (writes, mirrors) = build_link_account_updates(signing_pub_key.clone(), external_wallet, signature_type, signer_address, signer_type, block_tree, version);
-                    jmt_writes.extend(writes);
-                    app_mirror_inserts.extend(mirrors);
+                    let (writes, mirrors) = build_link_account_updates(signing_pub_key.clone(), external_wallet, signature_type, signer_address, signer_type, &pending_state, version);
+                    pending_state.apply_jmt_writes(writes);
+                    pending_state.apply_mirror_inserts(mirrors);
                 }
                 PismoOperation::NoOp => {
-                    let (writes, mirrors) = build_noop_updates(signing_pub_key.clone(), signer_address, signer_type, signature_type, block_tree, version);
-                    jmt_writes.extend(writes);
-                    app_mirror_inserts.extend(mirrors);
+                    let (writes, mirrors) = build_noop_updates(signing_pub_key.clone(), signer_address, signer_type, signature_type, &pending_state, version);
+                    pending_state.apply_jmt_writes(writes);
+                    pending_state.apply_mirror_inserts(mirrors);
                 }
                 PismoOperation::NewCoin { name, project_uri, logo_uri, total_supply, max_supply, canonical_chain_id } => {
                     let (writes, mirrors) = build_new_coin_updates(
@@ -443,11 +442,11 @@ impl PismoAppJMT {
                         signer_address,
                         signer_type,
                         signature_type,
-                        block_tree,
+                        &pending_state,
                         version
                     );
-                    jmt_writes.extend(writes);
-                    app_mirror_inserts.extend(mirrors);
+                    pending_state.apply_jmt_writes(writes);
+                    pending_state.apply_mirror_inserts(mirrors);
                 }
                 PismoOperation::Mint { coin_addr, account_addr, amount } => {
                     let (writes, mirrors) = build_mint_updates(
@@ -458,11 +457,11 @@ impl PismoAppJMT {
                         signer_address,
                         signer_type,
                         signature_type,
-                        block_tree,
+                        &pending_state,
                         version
                     );
-                    jmt_writes.extend(writes);
-                    app_mirror_inserts.extend(mirrors);
+                    pending_state.apply_jmt_writes(writes);
+                    pending_state.apply_mirror_inserts(mirrors);
                 }
                 PismoOperation::Transfer { coin_addr, receiver_addr, amount } => {
                     let (writes, mirrors) = build_transfer_updates(
@@ -473,11 +472,11 @@ impl PismoAppJMT {
                         signer_address,
                         signer_type,
                         signature_type,
-                        block_tree,
+                        &pending_state,
                         version
                     );
-                    jmt_writes.extend(writes);
-                    app_mirror_inserts.extend(mirrors);
+                    pending_state.apply_jmt_writes(writes);
+                    pending_state.apply_mirror_inserts(mirrors);
                 }
                 PismoOperation::CreateOrderbook { buy_asset, sell_asset } => {
                     let (writes, mirrors) = build_create_orderbook_updates(
@@ -487,12 +486,12 @@ impl PismoAppJMT {
                         signer_address,
                         signer_type,
                         signature_type,
-                        block_tree,
+                        &pending_state,
                         self.book_executor.clone(),
                         version
                     );
-                    jmt_writes.extend(writes);
-                    app_mirror_inserts.extend(mirrors);
+                    pending_state.apply_jmt_writes(writes);
+                    pending_state.apply_mirror_inserts(mirrors);
                 }
                 PismoOperation::NewLimitOrder { orderbook_address, is_buy, amount, tick_price } => {
                     let (writes, mirrors) = build_new_limit_order_updates(
@@ -504,23 +503,24 @@ impl PismoAppJMT {
                         signer_address,
                         signer_type,
                         signature_type,
-                        block_tree,
+                        &pending_state,
                         self.book_executor.clone(),
                         version
                     );
-                    jmt_writes.extend(writes);
-                    app_mirror_inserts.extend(mirrors);
+                    pending_state.apply_jmt_writes(writes);
+                    pending_state.apply_mirror_inserts(mirrors);
                 }
             }
         }
 
         // Process orderbook execution after all transactions have been processed
-        let (executor_writes, executor_mirrors) = build_executor_updates(&self.book_executor, block_tree, version);
-        jmt_writes.extend(executor_writes);
-        app_mirror_inserts.extend(executor_mirrors);
+        let (executor_writes, executor_mirrors) = build_executor_updates(&self.book_executor, &pending_state, version);
+        pending_state.apply_jmt_writes(executor_writes);
+        pending_state.apply_mirror_inserts(executor_mirrors);
 
-        // Prepare JMT writes using proper KeyHash and OwnedValue types
-        // No-op for counter state now
+        // Extract accumulated changes from pending state
+        let jmt_writes = pending_state.jmt_overlay.into_iter().collect::<Vec<_>>();
+        let app_mirror_inserts = pending_state.mirror_overlay.into_iter().collect::<Vec<_>>();
 
         // Use JMT to compute the new state root and AppStateUpdates
         // This follows the correct pattern: read from committed state, compute changes, return updates
@@ -545,17 +545,6 @@ impl PismoAppJMT {
 
         // The JMT updates already contain all the internal JMT operations
         let mut has_updates = has_jmt_changes;
-
-        // Also add the application-level counter state for HotStuff compatibility
-        // No-op mirror for counter now
-
-        // Write user modifications to AppStateUpdates as well
-        for (sui_address, updated_user) in user_modifications_in_block {
-            let sui_address_as_bytes = sui_address.as_bytes();
-            let serialized_user = updated_user.try_to_vec().unwrap();
-            jmt_updates.insert(sui_address_as_bytes.to_vec(), serialized_user);
-            has_updates = true;
-        }
 
         // Apply any app-level mirror inserts
         if !app_mirror_inserts.is_empty() {

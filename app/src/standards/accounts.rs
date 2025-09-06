@@ -8,6 +8,7 @@ use hotstuff_rs::block_tree::pluggables::KVStore;
 use jmt::KeyHash;
 
 use crate::transactions::{SignerType, SignatureType};
+use crate::jmt_state::StateReader;
 
 pub type Bytes = Vec<u8>;
 pub type AccountAddr = [u8; 32];
@@ -182,9 +183,16 @@ pub fn get_account<K: KVStore>(
     block_tree: &AppBlockTreeView<'_, K>,
     address: &AccountAddr,
     ) -> Option<Account> {
+    get_account_from_state(block_tree, address)
+}
+
+pub fn get_account_from_state(
+    state: &impl StateReader,
+    address: &AccountAddr,
+) -> Option<Account> {
     // Try app-level mirror object first
     let mirror_key = make_account_object_key(address);
-    if let Some(bytes) = block_tree.app_state(&mirror_key) {
+    if let Some(bytes) = state.get_mirror_value(&mirror_key) {
         if let Ok(account) = <Account as borsh::BorshDeserialize>::try_from_slice(&bytes) {
             return Some(account);
         }
@@ -193,14 +201,13 @@ pub fn get_account<K: KVStore>(
     None
 }
 
-/// Fetch an `ExternalLink` by signature_type and address from committed state
-pub fn get_link_object<K: KVStore>(
-    block_tree: &AppBlockTreeView<'_, K>,
+pub fn get_link_object_from_state(
+    state: &impl StateReader,
     signature_type: SignatureType,
     address: &str,
 ) -> Option<ExternalLink> {
     let link_key = make_link_object_key(signature_type, address);
-    if let Some(bytes) = block_tree.app_state(&link_key) {
+    if let Some(bytes) = state.get_mirror_value(&link_key) {
         if let Ok(link) = <ExternalLink as borsh::BorshDeserialize>::try_from_slice(&bytes) {
             return Some(link);
         }
@@ -218,13 +225,23 @@ pub fn get_account_from_signer<K: KVStore>(
     signature_type: SignatureType,
     signing_pub_key: &str,
 ) -> Option<Account> {
+    get_account_from_signer_state(block_tree, _signer_address, signer_type, signature_type, signing_pub_key)
+}
+
+pub fn get_account_from_signer_state(
+    state: &impl StateReader,
+    _signer_address: &String,
+    signer_type: SignerType,
+    signature_type: SignatureType,
+    signing_pub_key: &str,
+) -> Option<Account> {
     match signer_type {
         SignerType::NewAccount => {
             None
         }
         SignerType::Linked => {
-            if let Some(link) = get_link_object(block_tree, signature_type, signing_pub_key) {
-                get_account(block_tree, &link.account_addr)
+            if let Some(link) = get_link_object_from_state(state, signature_type, signing_pub_key) {
+                get_account_from_state(state, &link.account_addr)
             } else {
                 None
             }

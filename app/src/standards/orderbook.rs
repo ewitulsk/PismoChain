@@ -5,6 +5,7 @@ use hotstuff_rs::block_tree::accessors::app::AppBlockTreeView;
 use hotstuff_rs::block_tree::pluggables::KVStore;
 
 use crate::types::BorshIndexMap;
+use crate::jmt_state::StateReader;
 
 #[derive(Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, PartialEq, Eq)]
 pub struct Order {
@@ -254,8 +255,15 @@ pub fn get_orderbook<K: KVStore>(
     block_tree: &AppBlockTreeView<'_, K>,
     orderbook_addr: &OrderbookAddr,
 ) -> Option<Orderbook> {
+    get_orderbook_from_state(block_tree, orderbook_addr)
+}
+
+pub fn get_orderbook_from_state(
+    state: &impl StateReader,
+    orderbook_addr: &OrderbookAddr,
+) -> Option<Orderbook> {
     let mirror_key = make_orderbook_object_key(orderbook_addr);
-    if let Some(bytes) = block_tree.app_state(&mirror_key) {
+    if let Some(bytes) = state.get_mirror_value(&mirror_key) {
         if let Ok(orderbook) = <Orderbook as borsh::BorshDeserialize>::try_from_slice(&bytes) {
             return Some(orderbook);
         }

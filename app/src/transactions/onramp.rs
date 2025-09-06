@@ -2,11 +2,9 @@ use wormhole_vaas::{utils, Readable, Vaa, VaaBody, Writeable};
 use base64::Engine;
 use hex::FromHex;
 use anyhow::{Result, anyhow};
-use hotstuff_rs::block_tree::accessors::app::AppBlockTreeView;
-use hotstuff_rs::block_tree::pluggables::KVStore;
 use jmt::{KeyHash, OwnedValue};
-use crate::jmt_state::make_key_hash_from_parts;
-use crate::standards::coin::{Coin, CoinStore, derive_bridged_coin_addr, make_coin_object_key, derive_coin_store_addr, make_coin_store_object_key, get_coin, get_coin_store};
+use crate::jmt_state::{make_key_hash_from_parts, StateReader};
+use crate::standards::coin::{Coin, CoinStore, derive_bridged_coin_addr, make_coin_object_key, derive_coin_store_addr, make_coin_store_object_key, get_coin_from_state, get_coin_store_from_state};
 use crate::config::Config;
 
 /// Guardian set information with quorum calculation
@@ -238,11 +236,11 @@ pub fn verify_vaa_and_extract_message(vaa_raw: &str, guardian_set_index: u64, co
 }
 
 /// Build writes and app-mirror inserts for processing an onramp transaction
-pub fn build_onramp_updates<K: KVStore>(
+pub fn build_onramp_updates(
     vaa: &str,
     guardian_set_index: u64,
     config: &Config,
-    block_tree: &AppBlockTreeView<'_, K>,
+    state: &impl StateReader,
     _version: u64,
 ) -> (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>) {
     let mut jmt_writes: Vec<(KeyHash, Option<OwnedValue>)> = Vec::new();
@@ -284,7 +282,7 @@ pub fn build_onramp_updates<K: KVStore>(
     let coin_addr = derive_bridged_coin_addr(&onramp_message.token_address, onramp_message.emitter_chain);
     
     // Step 4: Check/Create/Update Coin
-    let coin = if let Some(mut existing_coin) = get_coin(block_tree, &coin_addr) {
+    let coin = if let Some(mut existing_coin) = get_coin_from_state(state, &coin_addr) {
         // Coin exists, increment total supply
         existing_coin.total_supply = existing_coin.total_supply.saturating_add(onramp_message.amount as u128);
         println!("📊 Updating bridged coin total supply to {}", existing_coin.total_supply);
@@ -307,7 +305,7 @@ pub fn build_onramp_updates<K: KVStore>(
 
     // Step 5: Check/Update recipient's coin store
     let coin_store_addr = derive_coin_store_addr(&recipient_addr, &coin_addr);
-    let coin_store = if let Some(mut existing_store) = get_coin_store(block_tree, &coin_store_addr) {
+    let coin_store = if let Some(mut existing_store) = get_coin_store_from_state(state, &coin_store_addr) {
         // Store exists, increment amount
         existing_store.amount = existing_store.amount.saturating_add(onramp_message.amount as u128);
         println!("💰 Adding {} tokens to existing store (new balance: {})", 

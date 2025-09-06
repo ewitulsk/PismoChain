@@ -5,6 +5,7 @@ use hotstuff_rs::block_tree::accessors::app::AppBlockTreeView;
 use hotstuff_rs::block_tree::pluggables::KVStore;
 
 use crate::standards::accounts::AccountAddr;
+use crate::jmt_state::StateReader;
 
 pub type CoinAddr = [u8; 32];
 pub type CoinStoreAddr = [u8; 32];
@@ -72,13 +73,12 @@ pub fn make_coin_store_object_key(coin_store_addr: &CoinStoreAddr) -> Vec<u8> {
     k
 }
 
-/// Fetch a `Coin` by `coin_addr` from committed state using the app-level mirror
-pub fn get_coin<K: KVStore>(
-    block_tree: &AppBlockTreeView<'_, K>,
+pub fn get_coin_from_state(
+    state: &impl StateReader,
     coin_addr: &CoinAddr,
 ) -> Option<Coin> {
     let mirror_key = make_coin_object_key(coin_addr);
-    if let Some(bytes) = block_tree.app_state(&mirror_key) {
+    if let Some(bytes) = state.get_mirror_value(&mirror_key) {
         if let Ok(coin) = <Coin as borsh::BorshDeserialize>::try_from_slice(&bytes) {
             return Some(coin);
         }
@@ -91,8 +91,15 @@ pub fn get_coin_store<K: KVStore>(
     block_tree: &AppBlockTreeView<'_, K>,
     coin_store_addr: &CoinStoreAddr,
 ) -> Option<CoinStore> {
+    get_coin_store_from_state(block_tree, coin_store_addr)
+}
+
+pub fn get_coin_store_from_state(
+    state: &impl StateReader,
+    coin_store_addr: &CoinStoreAddr,
+) -> Option<CoinStore> {
     let mirror_key = make_coin_store_object_key(coin_store_addr);
-    if let Some(bytes) = block_tree.app_state(&mirror_key) {
+    if let Some(bytes) = state.get_mirror_value(&mirror_key) {
         if let Ok(coin_store) = <CoinStore as borsh::BorshDeserialize>::try_from_slice(&bytes) {
             return Some(coin_store);
         }

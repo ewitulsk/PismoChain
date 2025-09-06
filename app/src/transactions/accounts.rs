@@ -4,20 +4,20 @@ use hotstuff_rs::block_tree::accessors::app::AppBlockTreeView;
 use hotstuff_rs::block_tree::pluggables::KVStore;
 use jmt::{KeyHash, OwnedValue};
 
-use crate::jmt_state::make_key_hash_from_parts;
+use crate::jmt_state::{make_key_hash_from_parts, StateReader};
 use crate::standards::accounts::{
     Account, AccountMeta, ExternalLink, Policy, ScopeBits,
     default_algo_for_signature_type, derive_account_addr, make_account_object_key, make_link_object_key,
-    get_account_from_signer, make_link_jmt_key_hash,
+    get_account_from_signer_state, make_link_jmt_key_hash,
 };
 use crate::transactions::{SignerType, SignatureType};
 
 /// Build writes and app-mirror inserts for creating a new account
-pub fn build_create_account_updates<K: KVStore>(
+pub fn build_create_account_updates(
     signature_type: SignatureType,
     signing_pub_key: String,
     _signer_type: SignerType,
-    _block_tree: &AppBlockTreeView<'_, K>,
+    _state: &impl StateReader,
     _version: u64,
 ) -> (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>) {
     let account_addr = derive_account_addr(1, signature_type, &signing_pub_key);
@@ -62,19 +62,19 @@ pub fn build_create_account_updates<K: KVStore>(
 
 /// Build writes and app-mirror inserts for linking a new external address
 /// This function handles all the logic including nonce increment
-pub fn build_link_account_updates<K: KVStore>(
+pub fn build_link_account_updates(
     signing_pub_key: String,
     external_wallet: &str,
     signature_type: SignatureType,
     signer_address: &str,
     signer_type: SignerType,
-    block_tree: &AppBlockTreeView<'_, K>,
+    state: &impl StateReader,
     _version: u64,
 ) -> (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>) {
     let mut jmt_writes: Vec<(KeyHash, Option<OwnedValue>)> = Vec::new();
     let mut mirror: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
 
-    if let Some(mut account) = get_account_from_signer(block_tree, &signer_address.to_string(), signer_type, signature_type, &signing_pub_key) {
+    if let Some(mut account) = get_account_from_signer_state(state, &signer_address.to_string(), signer_type, signature_type, &signing_pub_key) {
         let account_addr = account.account_addr;
         account.increment_nonce();
         

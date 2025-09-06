@@ -1,27 +1,25 @@
-use hotstuff_rs::block_tree::accessors::app::AppBlockTreeView;
-use hotstuff_rs::block_tree::pluggables::KVStore;
 use jmt::{KeyHash, OwnedValue};
 
-use crate::jmt_state::make_key_hash_from_parts;
+use crate::jmt_state::{make_key_hash_from_parts, StateReader};
 use crate::standards::accounts::{
-    get_account_from_signer, make_account_object_key,
+    get_account_from_signer_state, make_account_object_key,
 };
 use crate::standards::book_executor::BookExecutor;
 use crate::standards::orderbook::{
     Order, Orderbook, derive_orderbook_addr, 
-    make_orderbook_object_key, get_orderbook, generate_order_id,
+    make_orderbook_object_key, get_orderbook_from_state, generate_order_id,
 };
 use crate::transactions::{SignerType, SignatureType};
 
 /// Build writes and app-mirror inserts for creating a new orderbook
-pub fn build_create_orderbook_updates<K: KVStore>(
+pub fn build_create_orderbook_updates(
     buy_asset: String,
     sell_asset: String,
     signing_pub_key: String,
     signer_address: &str,
     signer_type: SignerType,
     signature_type: SignatureType,
-    block_tree: &AppBlockTreeView<'_, K>,
+    state: &impl StateReader,
     book_executor: BookExecutor,
     _version: u64,
 ) -> (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>) {
@@ -29,7 +27,7 @@ pub fn build_create_orderbook_updates<K: KVStore>(
     let mut mirror: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
 
     // Increment the account nonce
-    if let Some(mut account) = get_account_from_signer(block_tree, &signer_address.to_string(), signer_type, signature_type, &signing_pub_key) {
+    if let Some(mut account) = get_account_from_signer_state(state, &signer_address.to_string(), signer_type, signature_type, &signing_pub_key) {
         let account_addr = account.account_addr;
         account.increment_nonce();
         
@@ -79,7 +77,7 @@ pub fn build_create_orderbook_updates<K: KVStore>(
     let orderbook_addr = derive_orderbook_addr(&buy_asset_addr, &sell_asset_addr);
 
     // Check if orderbook already exists
-    if get_orderbook(block_tree, &orderbook_addr).is_some() {
+    if get_orderbook_from_state(state, &orderbook_addr).is_some() {
         println!("❌ Orderbook already exists for {:?}/{:?}", hex::encode(&buy_asset_addr[..8]), hex::encode(&sell_asset_addr[..8]));
         return (vec![], vec![]);
     }
@@ -107,7 +105,7 @@ pub fn build_create_orderbook_updates<K: KVStore>(
 }
 
 /// Build writes and app-mirror inserts for placing a new limit order
-pub fn build_new_limit_order_updates<K: KVStore>(
+pub fn build_new_limit_order_updates(
     orderbook_address: [u8; 32],
     is_buy: bool,
     amount: u128,
@@ -116,7 +114,7 @@ pub fn build_new_limit_order_updates<K: KVStore>(
     signer_address: &str,
     signer_type: SignerType,
     signature_type: SignatureType,
-    block_tree: &AppBlockTreeView<'_, K>,
+    state: &impl StateReader,
     book_executor: BookExecutor,
     _version: u64,
 ) -> (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>) {
@@ -125,8 +123,8 @@ pub fn build_new_limit_order_updates<K: KVStore>(
 
     // Check if orderbook exists and account exists
     if let (Some(mut orderbook), Some(mut account)) = (
-        get_orderbook(block_tree, &orderbook_address),
-        get_account_from_signer(block_tree, &signer_address.to_string(), signer_type, signature_type, &signing_pub_key)
+        get_orderbook_from_state(state, &orderbook_address),
+        get_account_from_signer_state(state, &signer_address.to_string(), signer_type, signature_type, &signing_pub_key)
     ) {
         account.increment_nonce();
         let account_addr = account.account_addr;
