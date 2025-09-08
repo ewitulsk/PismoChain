@@ -137,6 +137,8 @@ const JMT_VALUE_PREFIX: &[u8] = b"__jmt_value__";
 const JMT_ROOT_PREFIX: &[u8] = b"__jmt_root__";
 /// Prefix for the secondary "latest" index
 const JMT_LATEST_PREFIX: &[u8] = b"__jmt_latest__";
+/// Key for storing the latest JMT version
+pub const LATEST_VERSION_KEY: &[u8] = b"__jmt_latest_version__";
 const COMMITTED_APP_STATE: u8 = 3;
 
 /// Helper to create a latest-value index key for a given KeyHash
@@ -285,6 +287,9 @@ pub fn compute_jmt_updates<K: KVStore>(
     let mut root_key = JMT_ROOT_PREFIX.to_vec();
     root_key.extend_from_slice(&version.to_le_bytes());
     updates.insert(root_key, new_root.0.to_vec());
+
+    // Always update the latest version
+    updates.insert(LATEST_VERSION_KEY.to_vec(), version.to_le_bytes().to_vec());
 
     Ok((new_root, updates))
 }

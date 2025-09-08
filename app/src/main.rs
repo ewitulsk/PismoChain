@@ -2,11 +2,11 @@ mod database;
 mod jmt_state;
 mod pismo_app_jmt;
 mod transactions;
-mod crypto;
 mod config;
 mod types;
 mod standards;
 mod utils;
+mod validator_keys;
 
 use std::{
     sync::{Arc, Mutex},
@@ -20,15 +20,12 @@ use standards::{
     coin::{Coin, CoinStore},
 };
 use transactions::SignatureType;
-use database::mem_db::MemDB;
 use pismo_app_jmt::PismoAppJMT;
 use pismo_app_jmt::PismoTransaction;
 use config::load_config;
  
 
-// Add Sui SDK imports for signing
-use sui_sdk::types::crypto::{SuiKeyPair, get_key_pair_from_rng};
-use rand_core::OsRng;
+use validator_keys::{load_validator_keys, save_validator_keys, generate_validator_keypair};
 
 use hotstuff_rs::{
     replica::{Configuration, Replica, ReplicaSpec},
@@ -50,8 +47,9 @@ use std::{
     collections::HashMap,
 };
 
-use crate::{jmt_state::{make_key_hash_from_parts, DirectJMTReader}, standards::book_executor::BookExecutor};
+use crate::{database::rocks_db::RocksDBStore, jmt_state::{make_key_hash_from_parts, DirectJMTReader}, standards::book_executor::BookExecutor};
 use jmt::JellyfishMerkleTree;
+use hotstuff_rs::block_tree::accessors::public::BlockTreeCamera;
 
  
 
@@ -122,27 +120,35 @@ async fn main() {
         }
     };
 
-    // Generate signing key for this replica
-    let mut rng = OsRng;
-    let validator_keypair = SuiKeyPair::Ed25519(get_key_pair_from_rng(&mut rng).1);
-    
-    // Convert the Sui keypair to a HotStuff SigningKey using the same underlying Ed25519 key material
-    let keypair = crypto::sui_keypair_to_hotstuff_signing_key(&validator_keypair);
+    // Load or generate validator keypair
+    let keypair = match load_validator_keys("./validator.keys") {
+        Ok(keypair) => {
+            println!("📂 Loaded existing validator keypair from validator.keys");
+            keypair
+        }
+        Err(_) => {
+            println!("🔑 Generating new validator keypair...");
+            let keypair = generate_validator_keypair();
+            if let Err(e) = save_validator_keys("./validator.keys", &keypair) {
+                eprintln!("⚠️  Warning: Failed to save validator keypair: {}", e);
+                eprintln!("   The keypair will be regenerated on next restart.");
+            } else {
+                println!("💾 Saved new validator keypair to validator.keys");
+            }
+            keypair
+        }
+    };
     let verifying_key = keypair.verifying_key();
     
-    println!("🔑 Generated single Ed25519 keypair used for both validator and consensus:");
-    println!("   Validator public key: {:?}", validator_keypair.public());
-    println!("   HotStuff verifying key: {:?}", verifying_key.to_bytes());
+    println!("🔑 Validator Ed25519 keypair loaded:");
+    println!("   Public key: {}", hex::encode(verifying_key.to_bytes()));
 
     // Create the KV store using RocksDB (use default CF for simplicity)
-    // let db_path = "./data/pismo_db";
-    // let kv_store = RocksDBStore::new(db_path)
-    //     .expect("Failed to initialize RocksDB store");
+    let db_path = "./data/pismo_db";
+    let kv_store = RocksDBStore::new(db_path)
+        .expect("Failed to initialize RocksDB store");
 
-    let kv_store = MemDB::new();
-
-    // Initialize the app state with counter = 0
-    let init_app_state = PismoAppJMT::initial_app_state();
+    // let kv_store = MemDB::new();
 
     // Initialize validator set with just this replica
     let mut init_vs_updates = ValidatorSetUpdates::new();
@@ -157,8 +163,6 @@ async fn main() {
     
     // Create the BookExecutor for orderbook tracking
     let book_executor = BookExecutor::new();
-    
-    let pismo_app = PismoAppJMT::new(tx_queue.clone(), config.clone(), book_executor);
 
     // Configure the replica with faster view times
     let configuration = Configuration::builder()
@@ -173,18 +177,42 @@ async fn main() {
         .progress_msg_buffer_capacity(BufferSize::new(1024))
         .epoch_length(EpochLength::new(50))
         .max_view_time(Duration::from_millis(2000)) // Match test timing requirements
-        .log_events(false) // Disable verbose consensus logs
+        .log_events(true) // Disable verbose consensus logs
         .build();
 
-    // Initialize replica storage first
-    println!("🔧 Initializing replica storage with RocksDB...");
-    let kv_store_for_init = kv_store.clone();
-    Replica::initialize(kv_store_for_init, init_app_state, init_vs_state);
-    println!("✅ Replica storage initialized successfully");
-    
-    // Give storage a moment to ensure all writes are fully persisted
+    // Check if KV store is initialized
+    let needs_initialization = {
+        let block_tree_camera = BlockTreeCamera::new(kv_store.clone());
+        let snapshot = block_tree_camera.snapshot();
+        // Try to read validator set - if it fails, we need initialization
+        snapshot.committed_validator_set().is_err()
+    };
+
+    // Initialize only if needed
+    if needs_initialization {
+        println!("🔧 First time initialization - setting up replica storage...");
+        let init_app_state = PismoAppJMT::initial_app_state();
+        Replica::initialize(kv_store.clone(), init_app_state, init_vs_state);
+        println!("✅ Replica storage initialized successfully");
+    } else {
+        println!("📂 Existing data found - skipping initialization");
+    }
+
+    // Give storage a moment to ensure writes are persisted
     tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Read the latest version from app state
+    let initial_version = {
+        let block_tree_camera = BlockTreeCamera::new(kv_store.clone());
+        PismoAppJMT::read_latest_version(&block_tree_camera)
+    };
+    println!("📊 Starting with JMT version: {}", initial_version);
+
+    // Create PismoAppJMT with correct initial version
+    let pismo_app = PismoAppJMT::new(tx_queue.clone(), config.clone(), book_executor, initial_version);
     
+    println!("Created Pismo App");
+
     // Build and start the replica with the original kv_store
     let kv_store_for_rpc = kv_store.clone(); // Clone KV store for RPC access
     let _replica = ReplicaSpec::builder()

@@ -9,12 +9,6 @@ pub mod book_executor;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 
-// Sui SDK imports for cryptographic operations
-use sui_sdk::types::{
-    base_types::SuiAddress,
-    crypto::SuiKeyPair,
-};
-
 use crate::utils::verify_signatures::{
     build_signing_envelope,
     verify_phantom_signature_bytes,
@@ -28,8 +22,6 @@ use crate::standards::accounts::{
     get_account,
     get_account_from_signer,
 };
-use crate::crypto::sui_keypair_to_hotstuff_signing_key;
-use hotstuff_rs::types::crypto_primitives::Signer as _;
 use hotstuff_rs::block_tree::accessors::app::AppBlockTreeView;
 use hotstuff_rs::block_tree::pluggables::KVStore;
 use crate::pismo_app_jmt::PismoOperation;

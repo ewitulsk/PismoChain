@@ -29,7 +29,7 @@ use hotstuff_rs::{
 use crate::{standards::book_executor::BookExecutor, transactions::Transaction};
 use crate::transactions::onramp::build_onramp_updates;
 use crate::config::Config;
-use crate::jmt_state::{make_state_key, make_key_hash_from_parts, get_jmt_root, get_jmt_value, compute_jmt_updates, get_with_proof, PendingBlockState};
+use crate::jmt_state::{get_jmt_root, compute_jmt_updates, get_with_proof, PendingBlockState, LATEST_VERSION_KEY};
 use hotstuff_rs::block_tree::pluggables::KVStore;
 use jmt::{KeyHash, RootHash, OwnedValue, proof::SparseMerkleProof};
 
@@ -159,38 +159,35 @@ pub struct PismoAppJMT {
 
 impl PismoAppJMT {
     /// Create a new JMT-enhanced counter app
-    pub fn new(tx_queue: Arc<Mutex<Vec<PismoTransaction>>>, config: Config, book_executor: BookExecutor) -> Self {
+    pub fn new(tx_queue: Arc<Mutex<Vec<PismoTransaction>>>, config: Config, book_executor: BookExecutor, initial_version: u64) -> Self {
         Self {
             tx_queue,
             config,
-            next_version: 1, // Start at version 1, initialization handled by HotStuff
+            next_version: initial_version,
             book_executor,
         }
+    }
+
+    /// Read the latest JMT version from app state
+    pub fn read_latest_version<K: KVStore>(block_tree_camera: &hotstuff_rs::block_tree::accessors::public::BlockTreeCamera<K>) -> u64 {
+        let snapshot = block_tree_camera.snapshot();
+        if let Some(version_bytes) = snapshot.committed_app_state(LATEST_VERSION_KEY) {
+            if version_bytes.len() >= 8 {
+                // Return stored version + 1 for next version
+                return u64::from_le_bytes(version_bytes[..8].try_into().unwrap()) + 1;
+            }
+        }
+        // Default to 1 if not found
+        1
     }
 
     /// Return an `AppStateUpdates` that when applied on an empty app state will produce a good "initial"
     /// app state for a counter app: one containing the counter value 0.
     pub fn initial_app_state() -> AppStateUpdates {
         let mut state = AppStateUpdates::new();
-        let counter_key = make_state_key(COUNTER_ADDR, COUNTER_TAG);
-        state.insert(counter_key.to_vec(), 0i64.to_le_bytes().to_vec());
+        // Store initial version as 0
+        state.insert(LATEST_VERSION_KEY.to_vec(), 0u64.to_le_bytes().to_vec());
         state
-    }
-
-    /// Get counter value from the committed HotStuff state (not JMT directly)
-    pub fn get_counter_from_committed_state<K: hotstuff_rs::block_tree::pluggables::KVStore>(
-        block_tree: &hotstuff_rs::block_tree::accessors::app::AppBlockTreeView<K>,
-        version: u64
-    ) -> anyhow::Result<i64> {
-        let counter_key_hash = make_key_hash_from_parts(COUNTER_ADDR, COUNTER_TAG);
-        let counter_bytes = get_jmt_value(block_tree, counter_key_hash, version)?
-            .unwrap_or_else(|| 0i64.to_le_bytes().to_vec());
-        
-        let counter = i64::from_le_bytes(
-            counter_bytes.as_slice().try_into()
-                .map_err(|_| anyhow::anyhow!("Invalid counter bytes"))?
-        );
-        Ok(counter)
     }
 
     /// Get the current state root for a specific version
