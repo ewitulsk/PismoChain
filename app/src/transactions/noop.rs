@@ -8,14 +8,14 @@ use crate::transactions::{SignerType, SignatureType};
 
 /// Build writes and app-mirror inserts for a NoOp transaction
 /// This function only increments the account nonce without making any other changes
+/// Returns (success, (jmt_writes, mirror_inserts))
 pub fn build_noop_updates(
     signing_public_key: String,
     signer_address: &str,
     signer_type: SignerType,
     signature_type: SignatureType,
-    state: &impl StateReader,
-    _version: u64,
-) -> (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>) {
+    state: &impl StateReader
+) -> (bool, (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>)) {
     let mut jmt_writes: Vec<(KeyHash, Option<OwnedValue>)> = Vec::new();
     let mut mirror: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
 
@@ -29,7 +29,9 @@ pub fn build_noop_updates(
         let jmt_key = make_key_hash_from_parts(account_addr, b"acct");
         jmt_writes.push((jmt_key, Some(account_bytes.clone())));
         mirror.push((make_account_object_key(&account_addr), account_bytes));
+        
+        (true, (jmt_writes, mirror))
+    } else {
+        (false, (jmt_writes, mirror))
     }
-
-    (jmt_writes, mirror)
 }

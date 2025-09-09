@@ -13,6 +13,7 @@ use crate::standards::coin::{
 use crate::transactions::{SignerType, SignatureType};
 
 /// Build writes and app-mirror inserts for creating a new token
+/// Returns (success, (jmt_writes, mirror_inserts))
 pub fn build_new_coin_updates(
     name: String,
     project_uri: String,
@@ -24,9 +25,8 @@ pub fn build_new_coin_updates(
     signer_address: &str,
     signer_type: SignerType,
     signature_type: SignatureType,
-    state: &impl StateReader,
-    _version: u64,
-) -> (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>) {
+    state: &impl StateReader
+) -> (bool, (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>)) {
     let mut jmt_writes: Vec<(KeyHash, Option<OwnedValue>)> = Vec::new();
     let mut mirror: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
 
@@ -67,12 +67,16 @@ pub fn build_new_coin_updates(
         let account_jmt_key = make_key_hash_from_parts(account_addr, b"acct");
         jmt_writes.push((account_jmt_key, Some(account_bytes.clone())));
         mirror.push((make_account_object_key(&account_addr), account_bytes));
+        
+        (true, (jmt_writes, mirror))
+    } else {
+        // Account not found - this is a failure case, but we still create the coin
+        (true, (jmt_writes, mirror))
     }
-
-    (jmt_writes, mirror)
 }
 
 /// Build writes and app-mirror inserts for minting tokens
+/// Returns (success, (jmt_writes, mirror_inserts))
 pub fn build_mint_updates(
     coin_addr: [u8; 32],
     account_addr: [u8; 32],
@@ -81,9 +85,8 @@ pub fn build_mint_updates(
     signer_address: &str,
     signer_type: SignerType,
     signature_type: SignatureType,
-    state: &impl StateReader,
-    _version: u64,
-) -> (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>) {
+    state: &impl StateReader
+) -> (bool, (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>)) {
     let mut jmt_writes: Vec<(KeyHash, Option<OwnedValue>)> = Vec::new();
     let mut mirror: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
 
@@ -103,7 +106,9 @@ pub fn build_mint_updates(
 
         if let Some(max_supply) = coin.max_supply {
             if coin.total_supply > max_supply{
-                return (vec![], vec![]);
+                println!("❌ Mint failed: Would exceed max supply (current: {}, requested: {}, max: {})", 
+                    coin.total_supply.saturating_sub(amount), amount, max_supply);
+                return (false, (vec![], vec![]));
             }
         }
         
@@ -138,13 +143,17 @@ pub fn build_mint_updates(
         let account_jmt_key = make_key_hash_from_parts(account_addr_local, b"acct");
         jmt_writes.push((account_jmt_key, Some(account_bytes.clone())));
         mirror.push((make_account_object_key(&account_addr_local), account_bytes));
+        
+        (true, (jmt_writes, mirror))
+    } else {
+        // If either coin or account doesn't exist, this is a failure
+        println!("❌ Mint failed: Coin or account does not exist");
+        (false, (jmt_writes, mirror))
     }
-    // If either coin or account doesn't exist, don't create any updates
-
-    (jmt_writes, mirror)
 }
 
 /// Build writes and app-mirror inserts for transferring tokens between accounts
+/// Returns (success, (jmt_writes, mirror_inserts))
 pub fn build_transfer_updates(
     coin_addr: [u8; 32],
     receiver_addr: [u8; 32],
@@ -153,9 +162,8 @@ pub fn build_transfer_updates(
     signer_address: &str,
     signer_type: SignerType,
     signature_type: SignatureType,
-    state: &impl StateReader,
-    _version: u64,
-) -> (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>) {
+    state: &impl StateReader
+) -> (bool, (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>)) {
     let mut jmt_writes: Vec<(KeyHash, Option<OwnedValue>)> = Vec::new();
     let mut mirror: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
 
@@ -211,17 +219,20 @@ pub fn build_transfer_updates(
                 
                 println!("✅ Transfer successful: {} tokens from {:?} to {:?}", 
                     amount, hex::encode(&sender_account_addr[..8]), hex::encode(&receiver_addr[..8]));
+                
+                (true, (jmt_writes, mirror))
             } else {
                 println!("❌ Transfer failed: Insufficient balance (required: {}, available: {})", amount, sender_store.amount);
+                (false, (vec![], vec![]))
             }
         } else {
             println!("❌ Transfer failed: Sender has no coin store for this token");
+            (false, (vec![], vec![]))
         }
     } else {
         println!("❌ Transfer failed: Coin or sender account does not exist");
+        (false, (vec![], vec![]))
     }
-
-    (jmt_writes, mirror)
 }
 
 #[cfg(test)]

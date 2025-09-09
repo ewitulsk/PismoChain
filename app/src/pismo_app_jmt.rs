@@ -27,17 +27,13 @@ use hotstuff_rs::{
 // No direct use of Sui PublicKey needed for verification path now
 
 use crate::{standards::book_executor::BookExecutor, transactions::Transaction};
-use crate::transactions::onramp::build_onramp_updates;
 use crate::config::Config;
 use crate::jmt_state::{get_jmt_root, compute_jmt_updates, get_with_proof, PendingBlockState, LATEST_VERSION_KEY};
 use hotstuff_rs::block_tree::pluggables::KVStore;
 use jmt::{KeyHash, RootHash, OwnedValue, proof::SparseMerkleProof};
 
-use crate::transactions::accounts::{build_create_account_updates, build_link_account_updates};
-use crate::transactions::noop::build_noop_updates;
-use crate::transactions::coin::{build_new_coin_updates, build_mint_updates, build_transfer_updates};
-use crate::transactions::orderbook::{build_create_orderbook_updates, build_new_limit_order_updates};
 use crate::transactions::book_executor::build_executor_updates;
+use crate::execution::execute_transaction;
  
 
 /// Counter-specific transaction operations that can be performed
@@ -119,16 +115,18 @@ pub struct BlockPayload {
     pub transactions: Vec<PismoTransaction>,
     /// JMT state root after applying all transactions
     pub state_root: [u8; 32], // Keep as [u8; 32] for serialization compatibility
+    pub start_version: u64,
     /// Final JMT version after applying all transactions in this block
-    pub final_version: u64,
+    pub final_version: u64
 }
 
 impl BlockPayload {
-    pub fn new(transactions: Vec<PismoTransaction>, state_root: RootHash, final_version: u64) -> Self {
+    pub fn new(transactions: Vec<PismoTransaction>, state_root: RootHash, start_version: u64, final_version: u64) -> Self {
         Self {
             transactions,
             state_root: state_root.into(), // Convert RootHash to [u8; 32]
-            final_version,
+            start_version,
+            final_version
         }
     }
     
@@ -215,6 +213,7 @@ impl<K: KVStore> App<K> for PismoAppJMT {
 
         // Cache the starting version before we dequeue transactions
         let start_version = self.next_version;
+        let last_version = start_version.saturating_sub(1);
         
         let transactions_clone = {
             let mut tx_queue = self.tx_queue.lock().unwrap();
@@ -227,9 +226,9 @@ impl<K: KVStore> App<K> for PismoAppJMT {
         // If no transactions, return early with no state changes
         if transactions_clone.is_empty() {
             let block_tree = request.block_tree();
-            let previous_root = get_jmt_root(block_tree, start_version.saturating_sub(1))
+            let previous_root = get_jmt_root(block_tree, last_version)
                 .unwrap_or_else(|| RootHash([0u8; 32]));
-            let block_payload = BlockPayload::new(transactions_clone, previous_root, start_version.saturating_sub(1));
+            let block_payload = BlockPayload::new(transactions_clone, previous_root, last_version, last_version);
             let serialized_payload = block_payload.try_to_vec().unwrap();
             
             let data = Data::new(vec![Datum::new(serialized_payload)]);
@@ -247,23 +246,21 @@ impl<K: KVStore> App<K> for PismoAppJMT {
                 validator_set_updates: None,
             };
         }
-        
-        // Calculate the final version - this will be the version of the last transaction
-        let final_version = start_version + transactions_clone.len() as u64 - 1;
+
         let block_tree = request.block_tree();
         
         // Execute transactions and get new state root using the final version
-        let (app_state_updates, state_root) = self.execute(
+        let (app_state_updates, state_root, final_version) = self.execute(
             &transactions_clone, 
             &block_tree, 
-            final_version
+            start_version
         );
         
         // Advance the next_version counter for future blocks
-        self.next_version = final_version + 1;
+        self.next_version = final_version + 1; //I REALLY don't like tracking 3 different version types.
         
         // Create enhanced block payload with state root and final version
-        let block_payload = BlockPayload::new(transactions_clone, state_root, final_version);
+        let block_payload = BlockPayload::new(transactions_clone, state_root, start_version, final_version);
         let serialized_payload = block_payload.try_to_vec().unwrap();
         
         let data = Data::new(vec![Datum::new(serialized_payload)]);
@@ -312,7 +309,8 @@ impl<K: KVStore> App<K> for PismoAppJMT {
             &mut &*request.proposed_block().data.vec()[0].bytes().as_slice(),
         ) {
             // Use the actual final version from the block payload
-            let block_version = block_payload.final_version;
+            let block_final_version = block_payload.final_version;
+            let block_start_version = block_payload.start_version;
 
             // Validate all transactions in the block (signature, chain id, nonce)
             for transaction in &block_payload.transactions {
@@ -320,7 +318,7 @@ impl<K: KVStore> App<K> for PismoAppJMT {
                     println!("❌ Transaction validation failed: Transaction not signed");
                     return ValidateBlockResponse::Invalid;
                 }
-                match transaction.verify_with_state(self.config.chain_id, &initial_block_tree, block_version) {
+                match transaction.verify_with_state(self.config.chain_id, &initial_block_tree, block_start_version) {
                     Ok(true) => {}
                     Ok(false) => {
                         println!("❌ Transaction validation failed: signature/chain/nonce check failed for public_key {}", transaction.public_key);
@@ -334,7 +332,7 @@ impl<K: KVStore> App<K> for PismoAppJMT {
             }
 
             // Execute transactions with JMT and verify state root
-            let (app_state_updates, computed_state_root) = self.execute(&block_payload.transactions, &initial_block_tree, block_version);
+            let (app_state_updates, computed_state_root, _final_version) = self.execute(&block_payload.transactions, &initial_block_tree, block_start_version);
             
             // Verify that the computed state root matches the proposed one
             let expected_state_root = block_payload.state_root();
@@ -367,165 +365,38 @@ impl PismoAppJMT {
         transactions: &[PismoTransaction],
         block_tree: &AppBlockTreeView<'_, K>,
         version: u64,
-    ) -> (Option<AppStateUpdates>, RootHash) {
+    ) -> (Option<AppStateUpdates>, RootHash, u64) {
+
         // Create pending state overlay for intra-block transaction visibility
         let mut pending_state = PendingBlockState::new(block_tree, version);
 
         // Process transactions (business logic)
         for transaction in transactions {
-            // Chain id + signature + nonce checks using stateful verifier
-            match transaction.verify_with_state(self.config.chain_id, block_tree, version) {
-                Ok(true) => {}
-                Ok(false) => {
-                    println!("❌ Tx rejected by verification (chain_id/signature/nonce)");
-                    continue;
-                }
-                Err(e) => {
-                    println!("❌ Tx verification error: {}", e);
-                    continue;
-                }
-            }
-
-            let signing_pub_key = transaction.public_key.clone();
-            let signer_type = transaction.signer_type;
-            let signer_address = &transaction.signer;
-            let signature_type = transaction.signature_type;
-
-            // Skip non-CreateAccount transactions with NewAccount signer type
-            match (&transaction.payload, signer_type) {
-                (PismoOperation::CreateAccount { .. }, _) => {
-                    // CreateAccount is allowed with any signer type
-                }
-                (_, crate::transactions::SignerType::NewAccount) => {
-                    println!("❌ Skipping non-CreateAccount transaction with NewAccount signer type");
-                    continue;
-                }
-                _ => {
-                    // Other combinations are allowed
-                }
-            }
-
-            match &transaction.payload {
-                // Remove counter-only transactions per new requirements
-                PismoOperation::Onramp(vaa, guardian_set_index) => {
-                    let (writes, mirrors) = build_onramp_updates(vaa, *guardian_set_index, &self.config, &pending_state, version);
-                    pending_state.apply_jmt_writes(writes);
-                    pending_state.apply_mirror_inserts(mirrors);
-                }
-                PismoOperation::CreateAccount => {
-                    let (writes, mirrors) = build_create_account_updates(signature_type, signing_pub_key.clone(), signer_type, &pending_state, version);
-                    pending_state.apply_jmt_writes(writes);
-                    pending_state.apply_mirror_inserts(mirrors);
-                }
-                PismoOperation::LinkAccount { external_wallet } => {
-                    let (writes, mirrors) = build_link_account_updates(signing_pub_key.clone(), external_wallet, signature_type, signer_address, signer_type, &pending_state, version);
-                    pending_state.apply_jmt_writes(writes);
-                    pending_state.apply_mirror_inserts(mirrors);
-                }
-                PismoOperation::NoOp => {
-                    let (writes, mirrors) = build_noop_updates(signing_pub_key.clone(), signer_address, signer_type, signature_type, &pending_state, version);
-                    pending_state.apply_jmt_writes(writes);
-                    pending_state.apply_mirror_inserts(mirrors);
-                }
-                PismoOperation::NewCoin { name, project_uri, logo_uri, total_supply, max_supply, canonical_chain_id } => {
-                    let (writes, mirrors) = build_new_coin_updates(
-                        name.clone(),
-                        project_uri.clone(),
-                        logo_uri.clone(),
-                        *total_supply,
-                        *max_supply,
-                        *canonical_chain_id,
-                        signing_pub_key.clone(),
-                        signer_address,
-                        signer_type,
-                        signature_type,
-                        &pending_state,
-                        version
-                    );
-                    pending_state.apply_jmt_writes(writes);
-                    pending_state.apply_mirror_inserts(mirrors);
-                }
-                PismoOperation::Mint { coin_addr, account_addr, amount } => {
-                    let (writes, mirrors) = build_mint_updates(
-                        *coin_addr,
-                        *account_addr,
-                        *amount,
-                        signing_pub_key.clone(),
-                        signer_address,
-                        signer_type,
-                        signature_type,
-                        &pending_state,
-                        version
-                    );
-                    pending_state.apply_jmt_writes(writes);
-                    pending_state.apply_mirror_inserts(mirrors);
-                }
-                PismoOperation::Transfer { coin_addr, receiver_addr, amount } => {
-                    let (writes, mirrors) = build_transfer_updates(
-                        *coin_addr,
-                        *receiver_addr,
-                        *amount,
-                        signing_pub_key.clone(),
-                        signer_address,
-                        signer_type,
-                        signature_type,
-                        &pending_state,
-                        version
-                    );
-                    pending_state.apply_jmt_writes(writes);
-                    pending_state.apply_mirror_inserts(mirrors);
-                }
-                PismoOperation::CreateOrderbook { buy_asset, sell_asset } => {
-                    let (writes, mirrors) = build_create_orderbook_updates(
-                        buy_asset.clone(),
-                        sell_asset.clone(),
-                        signing_pub_key.clone(),
-                        signer_address,
-                        signer_type,
-                        signature_type,
-                        &pending_state,
-                        self.book_executor.clone(),
-                        version
-                    );
-                    pending_state.apply_jmt_writes(writes);
-                    pending_state.apply_mirror_inserts(mirrors);
-                }
-                PismoOperation::NewLimitOrder { orderbook_address, is_buy, amount, tick_price } => {
-                    let (writes, mirrors) = build_new_limit_order_updates(
-                        *orderbook_address,
-                        *is_buy,
-                        *amount,
-                        *tick_price,
-                        signing_pub_key.clone(),
-                        signer_address,
-                        signer_type,
-                        signature_type,
-                        &pending_state,
-                        self.book_executor.clone(),
-                        version
-                    );
-                    pending_state.apply_jmt_writes(writes);
-                    pending_state.apply_mirror_inserts(mirrors);
-                }
-            }
+            // Execute the transaction using the execution module (includes verification)
+            execute_transaction(transaction, &self.config, block_tree, &mut pending_state, &self.book_executor);
         }
 
         // Process orderbook execution after all transactions have been processed
         let (executor_writes, executor_mirrors) = build_executor_updates(&self.book_executor, &pending_state, version);
+        if !executor_writes.is_empty() {
+            pending_state.version += 1; //Count the orderbook executor as a transaction
+        }; 
         pending_state.apply_jmt_writes(executor_writes);
         pending_state.apply_mirror_inserts(executor_mirrors);
-
+        
         // Extract accumulated changes from pending state
         let jmt_writes = pending_state.jmt_overlay.into_iter().collect::<Vec<_>>();
         let app_mirror_inserts = pending_state.mirror_overlay.into_iter().collect::<Vec<_>>();
+
+        let new_version = pending_state.version;
 
         // Use JMT to compute the new state root and AppStateUpdates
         // This follows the correct pattern: read from committed state, compute changes, return updates
         let has_jmt_changes = !jmt_writes.is_empty();
         let (state_root, mut jmt_updates) = if has_jmt_changes {
-            match compute_jmt_updates(block_tree, version, jmt_writes) {
+            match compute_jmt_updates(block_tree, new_version, jmt_writes) {
                 Ok((root, updates)) => {
-                    println!("🌳 Computed JMT root at version {}: {:?}", version, hex::encode(&root.0[..8]));
+                    println!("🌳 Computed JMT root at version {}: {:?}", new_version, hex::encode(&root.0[..8]));
                     (root, updates)
                 }
                 Err(e) => {
@@ -535,7 +406,7 @@ impl PismoAppJMT {
             }
         } else {
             // No state changes, return previous root
-            let prev_root = get_jmt_root(block_tree, version)
+            let prev_root = get_jmt_root(block_tree, new_version)
                 .unwrap_or_else(|| RootHash([0u8; 32]));
             (prev_root, AppStateUpdates::new())
         };
@@ -553,6 +424,6 @@ impl PismoAppJMT {
 
         let app_state_updates = if has_updates { Some(jmt_updates) } else { None };
         
-        (app_state_updates, state_root)
+        (app_state_updates, state_root, new_version)
     }
 }
