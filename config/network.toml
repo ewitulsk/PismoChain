@@ -1,0 +1,27 @@
+# Network configuration for PismoChain LibP2P networking
+# This file defines the validator network topology
+
+listen_addresses = [
+    "/ip4/0.0.0.0/udp/9000/quic-v1"
+]
+
+# Connection settings
+connection_timeout = 30
+max_connections_per_peer = 1
+message_queue_size = 1000
+max_retry_attempts = 5
+retry_backoff_base_ms = 1000
+
+[[validators]]
+verifying_key = "4d1ecbea5b5430ad8a1c2485d2626988fe70b507828054766332b40e79dde8b7"
+peer_id = "12D3KooWF1QoFFur58XXdgaJmdRT1TdpHBHeC9SFkYoLjWhn5peA"
+multiaddrs = [
+   "/ip4/127.0.0.1/udp/9000/quic-v1"
+]
+
+[[validators]]
+verifying_key = "f7cb743606a692cedc3a052ac8c34d15b4fc63b3b7122818aae35476ae395a97"
+peer_id = "12D3KooWSVeohAvVRJ2nd6UeysRGm9GaL9BwmBwuMbiTu5HExeqU"
+multiaddrs = [
+   "/ip4/127.0.0.1/udp/9001/quic-v1"
+]

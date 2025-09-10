@@ -8,6 +8,7 @@ mod standards;
 mod utils;
 mod validator_keys;
 mod execution;
+mod networking;
 
 use std::{
     sync::{Arc, Mutex},
@@ -36,79 +37,71 @@ use hotstuff_rs::{
         validator_set::{ValidatorSet, ValidatorSetState},
         update_sets::ValidatorSetUpdates,
     },
-    networking::{network::Network, messages::Message},
 };
 use jsonrpsee::server::ServerBuilder;
 use jsonrpsee::RpcModule;
  
 use tokio::signal;
 
-use std::{
-    sync::mpsc::{self, Receiver, Sender, TryRecvError},
-    collections::HashMap,
-};
 
-use crate::{database::rocks_db::RocksDBStore, jmt_state::{make_key_hash_from_parts, DirectJMTReader}, standards::book_executor::BookExecutor};
+use crate::{
+    database::rocks_db::RocksDBStore,
+    jmt_state::{make_key_hash_from_parts, DirectJMTReader},
+    standards::book_executor::BookExecutor,
+    networking::{MockNetwork, LibP2PNetwork, NetworkRuntimeConfig, load_network_config, create_libp2p_keypair_from_validator},
+};
 use jmt::JellyfishMerkleTree;
 use hotstuff_rs::block_tree::accessors::public::BlockTreeCamera;
 
- 
-
-// Mock network implementation for single node setup
-#[derive(Clone)]
-struct MockNetwork {
-    my_verifying_key: VerifyingKey,
-    all_peers: HashMap<VerifyingKey, Sender<(VerifyingKey, Message)>>,
-    inbox: Arc<Mutex<Receiver<(VerifyingKey, Message)>>>,
-}
-
-impl MockNetwork {
-    fn new(verifying_key: VerifyingKey) -> Self {
-        let (sender, receiver) = mpsc::channel();
-        let mut all_peers = HashMap::new();
-        all_peers.insert(verifying_key, sender);
+/// Build validator set from network configuration
+fn build_validator_set_from_network_config(
+    network_config: &networking::NetworkConfig,
+) -> anyhow::Result<ValidatorSet> {
+    let mut init_vs_updates = ValidatorSetUpdates::new();
+    
+    for validator in &network_config.validators {
+        // Parse verifying key from hex string
+        let vk_bytes = hex::decode(&validator.verifying_key)?;
+        let verifying_key = VerifyingKey::try_from(vk_bytes.as_slice())
+            .map_err(|e| anyhow::anyhow!("Invalid verifying key: {:?}", e))?;
         
-        Self {
-            my_verifying_key: verifying_key,
-            all_peers,
-            inbox: Arc::new(Mutex::new(receiver)),
-        }
-    }
-}
-
-impl Network for MockNetwork {
-    fn init_validator_set(&mut self, _validator_set: ValidatorSet) {
-        // No-op for single node
-    }
-
-    fn update_validator_set(&mut self, _updates: ValidatorSetUpdates) {
-        // No-op for single node
-    }
-
-    fn send(&mut self, peer: VerifyingKey, message: Message) {
-        if let Some(peer_sender) = self.all_peers.get(&peer) {
-            let _ = peer_sender.send((self.my_verifying_key, message));
-        }
+        // Add each validator with equal power
+        init_vs_updates.insert(verifying_key, Power::new(1));
     }
     
-    fn broadcast(&mut self, message: Message) {
-        for (_, peer_sender) in &self.all_peers {
-            let _ = peer_sender.send((self.my_verifying_key, message.clone()));
-        }
-    }
-
-    fn recv(&mut self) -> Option<(VerifyingKey, Message)> {
-        match self.inbox.lock().unwrap().try_recv() {
-            Ok(message) => Some(message),
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => None,
-        }
-    }
+    let mut validator_set = ValidatorSet::new();
+    validator_set.apply_updates(&init_vs_updates);
+    Ok(validator_set)
 }
 
 #[tokio::main]
 async fn main() {
+
+    tracing_subscriber::fmt::init();
+
+    // Network layer selection based on environment variable
+    let use_libp2p = std::env::var("PISMO_NETWORK").unwrap_or_default() == "libp2p";
+    let validator_keys_path = std::env::var("VALIDATOR_KEYS_PATH")
+        .unwrap_or_else(|_| "./validator.keys".to_string());
+    let network_config_path = std::env::var("PISMO_NETWORK_CONFIG")
+        .unwrap_or_else(|_| "config/network.toml".to_string());
+    let db_path = std::env::var("PISMO_DB_PATH")
+        .unwrap_or_else(|_| "./data/pismo_db".to_string());
+    let server_port = std::env::var("PISMO_RPC_PORT")
+        .unwrap_or_else(|_| "9944".to_string());
+    
     println!("🚀 Starting PismoChain Counter App with Transaction Validation...");
+    println!("================================================================");
+    println!("📋 Environment Variables:");
+    println!("   PISMO_NETWORK=libp2p      - Enable distributed networking (current: {})", 
+        if use_libp2p { "libp2p" } else { "mock" });
+    println!("   PISMO_INIT_STORAGE=true   - Initialize/reinitialize storage");
+    println!("   PISMO_NETWORK_CONFIG=path - Network config file (current: {})", 
+        network_config_path);
+    println!("   VALIDATOR_KEYS_PATH=path  - Validator keys file (current: {})", 
+        validator_keys_path);
+    println!("   PISMO_DB_PATH=path        - Database path (current: {})", db_path);
+    println!("   PISMO_RPC_PORT=port       - RPC port (current: {})", server_port);
     println!("================================================================");
     
     // Load configuration from CONFIG_PATH environment variable or default path
@@ -122,19 +115,19 @@ async fn main() {
     };
 
     // Load or generate validator keypair
-    let keypair = match load_validator_keys("./validator.keys") {
+    let keypair = match load_validator_keys(&validator_keys_path) {
         Ok(keypair) => {
-            println!("📂 Loaded existing validator keypair from validator.keys");
+            println!("📂 Loaded existing validator keypair from {}", validator_keys_path);
             keypair
         }
         Err(_) => {
             println!("🔑 Generating new validator keypair...");
             let keypair = generate_validator_keypair();
-            if let Err(e) = save_validator_keys("./validator.keys", &keypair) {
+            if let Err(e) = save_validator_keys(&validator_keys_path, &keypair) {
                 eprintln!("⚠️  Warning: Failed to save validator keypair: {}", e);
                 eprintln!("   The keypair will be regenerated on next restart.");
             } else {
-                println!("💾 Saved new validator keypair to validator.keys");
+                println!("💾 Saved new validator keypair to {}", validator_keys_path);
             }
             keypair
         }
@@ -144,20 +137,80 @@ async fn main() {
     println!("🔑 Validator Ed25519 keypair loaded:");
     println!("   Public key: {}", hex::encode(verifying_key.to_bytes()));
 
+    // Load network configuration early (before KV store)
+    let network_config = match load_network_config(&network_config_path) {
+        Ok(config) => {
+            println!("📁 Loaded network config from {}", network_config_path);
+            config
+        }
+        Err(e) if !use_libp2p => {
+            // For MockNetwork mode, create single-validator config if file missing
+            println!("⚠️  Network config not found ({}), creating single-validator config", e);
+            let mut config = networking::NetworkConfig::default();
+            config.validators.push(crate::networking::config::ValidatorConfig {
+                verifying_key: hex::encode(verifying_key.to_bytes()),
+                peer_id: "mock-peer".to_string(),
+                multiaddrs: vec!["/ip4/127.0.0.1/udp/9000/quic-v1".to_string()],
+            });
+            config
+        }
+        Err(e) => {
+            eprintln!("❌ Failed to load network config from {}: {}", network_config_path, e);
+            eprintln!("💡 Create a network config file or set PISMO_NETWORK_CONFIG to a valid path");
+            std::process::exit(1);
+        }
+    };
+
+    // Validate that this node is in the network config
+    let my_hex_key = hex::encode(verifying_key.to_bytes());
+    let is_in_config = network_config.validators.iter().any(|v| v.verifying_key == my_hex_key);
+
+    if !is_in_config {
+        eprintln!("❌ ERROR: This validator is not in the network configuration!");
+        eprintln!("   My key: {}", my_hex_key);
+        eprintln!("   Configured validators:");
+        for (i, v) in network_config.validators.iter().enumerate() {
+            eprintln!("     {}. {}", i + 1, v.verifying_key);
+        }
+        eprintln!("");
+        eprintln!("💡 Either:");
+        eprintln!("   - Add this validator to {}", network_config_path);
+        eprintln!("   - Use a validator key that's already in the config");
+        eprintln!("   - Set VALIDATOR_KEYS_PATH to point to a configured validator's keys");
+        std::process::exit(1);
+    }
+
+    // Build validator set from network config
+    let network_validator_set = match build_validator_set_from_network_config(&network_config) {
+        Ok(vs) => {
+            println!("🔐 Network validator set contains {} validators:", vs.len());
+            for (vk, power) in vs.validators_and_powers() {
+                let is_me = &vk == &verifying_key;
+                println!("   - {} (power: {}){}", 
+                    &hex::encode(vk.to_bytes())[..16], // Show first 16 chars 
+                    power.int(),
+                    if is_me { " <- This node" } else { "" }
+                );
+            }
+            vs
+        }
+        Err(e) => {
+            eprintln!("❌ Failed to build validator set from config: {}", e);
+            std::process::exit(1);
+        }
+    };
+
     // Create the KV store using RocksDB (use default CF for simplicity)
-    let db_path = "./data/pismo_db";
-    let kv_store = RocksDBStore::new(db_path)
+    let kv_store = RocksDBStore::new(&db_path)
         .expect("Failed to initialize RocksDB store");
 
-    // let kv_store = MemDB::new();
-
-    // Initialize validator set with just this replica
-    let mut init_vs_updates = ValidatorSetUpdates::new();
-    init_vs_updates.insert(verifying_key, Power::new(1));
-    
-    let mut init_vs = ValidatorSet::new();
-    init_vs.apply_updates(&init_vs_updates);
-    let init_vs_state = ValidatorSetState::new(init_vs.clone(), init_vs, None, true);
+    // Create validator set state from network config
+    let init_vs_state = ValidatorSetState::new(
+        network_validator_set.clone(),
+        network_validator_set.clone(),
+        None,
+        true
+    );
 
     // Create transaction queue for the counter app
     let tx_queue = Arc::new(Mutex::new(Vec::new()));
@@ -165,9 +218,9 @@ async fn main() {
     // Create the BookExecutor for orderbook tracking
     let book_executor = BookExecutor::new();
 
-    // Configure the replica with faster view times
+    // Configure the replica with faster view times  
     let configuration = Configuration::builder()
-        .me(keypair)
+        .me(keypair.clone())
         .chain_id(ChainID::new(4206980085))
         .block_sync_request_limit(10)
         .block_sync_server_advertise_time(Duration::new(10, 0))
@@ -178,25 +231,61 @@ async fn main() {
         .progress_msg_buffer_capacity(BufferSize::new(1024))
         .epoch_length(EpochLength::new(50))
         .max_view_time(Duration::from_millis(2000)) // Match test timing requirements
-        .log_events(true) // Disable verbose consensus logs
+        .log_events(true) // Enable consensus logs for debugging
         .build();
 
-    // Check if KV store is initialized
-    let needs_initialization = {
-        let block_tree_camera = BlockTreeCamera::new(kv_store.clone());
-        let snapshot = block_tree_camera.snapshot();
-        // Try to read validator set - if it fails, we need initialization
-        snapshot.committed_validator_set().is_err()
-    };
+    // Add debug logging for consensus
+    println!("📊 Consensus configuration:");
+    println!("   Chain ID: {}", configuration.chain_id.int());
+    println!("   My validator key: {}", hex::encode(verifying_key.to_bytes()));
+    println!("   Total validators: {}", network_validator_set.len());
+    println!("   Validators in set:");
+    for (vk, power) in network_validator_set.validators_and_powers() {
+        let is_me = &vk == &verifying_key;
+        println!("   - {} (power: {}){}", 
+            hex::encode(vk.to_bytes()), 
+            power.int(),
+            if is_me { " <- This node" } else { "" }
+        );
+    }
 
-    // Initialize only if needed
+    // Storage initialization is controlled by PISMO_INIT_STORAGE environment variable
+    // This allows operators to explicitly control when to initialize or reinitialize storage
+    // 
+    // Usage scenarios:
+    // - First time setup: PISMO_INIT_STORAGE=true
+    // - Join existing network: PISMO_INIT_STORAGE=false (use existing storage)  
+    // - Reset node: PISMO_INIT_STORAGE=true (reinitialize with network config)
+    
+    // Check if initialization is needed via environment variable
+    let needs_initialization = std::env::var("PISMO_INIT_STORAGE")
+        .unwrap_or_else(|_| "false".to_string())
+        .to_lowercase() == "true";
+
     if needs_initialization {
-        println!("🔧 First time initialization - setting up replica storage...");
+        println!("🔧 Storage initialization requested via PISMO_INIT_STORAGE=true");
+    }
+
+    // Initialize if requested
+    if needs_initialization {
+        println!("🔧 Initializing replica storage with network validator set...");
         let init_app_state = PismoAppJMT::initial_app_state();
         Replica::initialize(kv_store.clone(), init_app_state, init_vs_state);
-        println!("✅ Replica storage initialized successfully");
+        println!("✅ Replica storage initialized with {} validators", network_validator_set.len());
     } else {
-        println!("📂 Existing data found - skipping initialization");
+        println!("📂 Using existing storage (set PISMO_INIT_STORAGE=true to reinitialize)");
+        
+        // Optionally warn if we can read the stored validator set and it differs
+        let block_tree_camera = BlockTreeCamera::new(kv_store.clone());
+        let snapshot = block_tree_camera.snapshot();
+        match snapshot.committed_validator_set() {
+            Ok(stored_vs) if stored_vs.len() != network_validator_set.len() => {
+                println!("⚠️  WARNING: Stored validator set has {} validators, but network config has {}",
+                    stored_vs.len(), network_validator_set.len());
+                println!("   Run with PISMO_INIT_STORAGE=true to reinitialize with network config");
+            }
+            _ => {}
+        }
     }
 
     // Give storage a moment to ensure writes are persisted
@@ -216,21 +305,76 @@ async fn main() {
 
     // Build and start the replica with the original kv_store
     let kv_store_for_rpc = kv_store.clone(); // Clone KV store for RPC access
-    let _replica = ReplicaSpec::builder()
-        .app(pismo_app)
-        .network(MockNetwork::new(verifying_key))
-        .kv_store(kv_store)
-        .configuration(configuration)
-        .build()
-        .start();
+    
+    let replica = if use_libp2p {
+        println!("🌐 Using LibP2P + QUIC networking layer");
+        
+        // The network_config is already loaded above, use it for LibP2P
+        let runtime_config = match NetworkRuntimeConfig::from_network_config(network_config.clone()) {
+            Ok(config) => config,
+            Err(e) => {
+                eprintln!("❌ Failed to create network runtime config: {}", e);
+                std::process::exit(1);
+            }
+        };
+        
+        // Create libp2p keypair from the same Ed25519 key material as the validator
+        let libp2p_keypair = match create_libp2p_keypair_from_validator(&keypair) {
+            Ok(keypair) => keypair,
+            Err(e) => {
+                eprintln!("❌ Failed to create libp2p keypair: {}", e);
+                std::process::exit(1);
+            }
+        };
+        
+        // Create LibP2P network
+        let network = match LibP2PNetwork::new(libp2p_keypair, runtime_config).await {
+            Ok(network) => network,
+            Err(e) => {
+                eprintln!("❌ Failed to initialize LibP2P network: {}", e);
+                std::process::exit(1);
+            }
+        };
+        
+        println!("🔗 LibP2P network initialized with peer ID: {}", network.local_peer_id());
+        println!("🔐 Using same Ed25519 key material for both consensus and networking");
+        
+        ReplicaSpec::builder()
+            .app(pismo_app)
+            .network(network)
+            .kv_store(kv_store)
+            .configuration(configuration)
+            .build()
+            .start()
+    } else {
+        println!("🔧 Using MockNetwork (single node development mode)");
+        println!("   Note: MockNetwork still uses validator set from network.toml");
+        println!("💡 Set PISMO_NETWORK=libp2p to enable distributed networking");
+        
+        ReplicaSpec::builder()
+            .app(pismo_app)
+            .network(MockNetwork::new(verifying_key))
+            .kv_store(kv_store)
+            .configuration(configuration)
+            .build()
+            .start()
+    };
 
     println!("✅ PismoChain replica started with transaction validation!");
     println!("📊 Initial counter value: 0");
+    
+    if use_libp2p {
+        println!("🌐 Network: LibP2P + QUIC (distributed consensus ready)");
+    } else {
+        println!("🔧 Network: MockNetwork (single node development)");
+    }
     println!("================================================================");
 
     // Start JSON-RPC server to accept transactions (async)
+    let server_addr = format!("127.0.0.1:{}", server_port);
+    
     let server = ServerBuilder::default()
-        .build("127.0.0.1:9944")
+        .build(&server_addr)
         .await
         .expect("start jsonrpc server");
 
@@ -441,10 +585,11 @@ async fn main() {
         .expect("register view method");
 
     let server_handle = server.start(module);
-    println!("🔌 JSON-RPC server listening on http://127.0.0.1:9944");
+    println!("🔌 JSON-RPC server listening on http://{}", server_addr);
     println!("   Methods: submit_borsh_tx, view (types: Account, Coin, CoinStore, Link)");
 
     // Keep the node alive using tokio::select! (exit on RPC stop or ctrl-c)
+    // The replica variable is kept in scope to prevent it from being dropped
     tokio::select! {
         _ = server_handle.stopped() => {
             println!("🛑 JSON-RPC server stopped");
@@ -453,4 +598,7 @@ async fn main() {
             println!("👋 Caught ctrl-c, shutting down");
         }
     }
+    
+    // Explicitly drop the replica at the end to ensure clean shutdown
+    drop(replica);
 }
