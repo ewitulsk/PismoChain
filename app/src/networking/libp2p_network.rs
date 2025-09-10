@@ -30,7 +30,7 @@ use hotstuff_rs::{
 };
 
 use crate::networking::{
-    behaviour::{HotstuffBehaviour, HotstuffEvent},
+    stream_behaviour::{StreamBehaviour, StreamEvent},
     config::NetworkRuntimeConfig,
 };
 
@@ -113,7 +113,7 @@ impl LibP2PNetwork {
         let transport = Self::build_transport(&keypair)?;
 
         // Create the behaviour
-        let behaviour = HotstuffBehaviour::new(local_peer_id, keypair.public(), config.clone());
+        let behaviour = StreamBehaviour::new(local_peer_id, keypair.public(), config.clone());
 
         // Create the swarm using the new API
         let mut swarm = SwarmBuilder::with_existing_identity(keypair.clone())
@@ -193,7 +193,7 @@ impl LibP2PNetwork {
 
     /// Main network task that handles swarm events and commands
     async fn network_task(
-        mut swarm: Swarm<HotstuffBehaviour>,
+        mut swarm: Swarm<StreamBehaviour>,
         mut command_receiver: UnboundedReceiver<NetworkCommand>,
         event_sender: UnboundedSender<NetworkEvent>,
         config: NetworkRuntimeConfig,
@@ -218,10 +218,6 @@ impl LibP2PNetwork {
 
         info!("Network task: Entering main event loop");
         loop {
-            info!("Network task: Starting select loop iteration");
-            
-            // Wrap each select operation in a result for better error handling
-            info!("Network task: About to enter tokio::select!");
             let loop_result: Result<bool, Box<dyn std::error::Error + Send + Sync>> = tokio::select! {
                 // Handle swarm events
                 maybe_event = swarm.next() => {
@@ -229,9 +225,9 @@ impl LibP2PNetwork {
                         Some(event_result) => {
                             info!("Network task: Received swarm event");
                             match event_result {
-                        SwarmEvent::Behaviour(hotstuff_event) => {
-                            info!("Handling behaviour event: {:?}", std::mem::discriminant(&hotstuff_event));
-                            Self::handle_behaviour_event(hotstuff_event, &event_sender, &config).await;
+                        SwarmEvent::Behaviour(stream_event) => {
+                            info!("Handling behaviour event: {:?}", std::mem::discriminant(&stream_event));
+                            Self::handle_behaviour_event(stream_event, &event_sender, &config).await;
                         }
                         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                             info!("Connection established with peer: {}", peer_id);
@@ -318,7 +314,7 @@ impl LibP2PNetwork {
                 // Periodic cleanup
                 _ = cleanup_interval.tick() => {
                     debug!("Network task: Processing cleanup tick");
-                    swarm.behaviour_mut().cleanup_expired_requests();
+                    swarm.behaviour_mut().cleanup_expired_connections();
                     Ok(false) // Continue loop
                 }
             };
@@ -342,12 +338,12 @@ impl LibP2PNetwork {
 
     /// Handle behaviour events from the swarm
     async fn handle_behaviour_event(
-        event: HotstuffEvent,
+        event: StreamEvent,
         event_sender: &UnboundedSender<NetworkEvent>,
         config: &NetworkRuntimeConfig,
     ) {
         match event {
-            HotstuffEvent::MessageReceived { peer_id, message, .. } => {
+            StreamEvent::MessageReceived { peer_id, message, .. } => {
                 // Look up the verifying key for this peer
                 if let Some(verifying_key) = config.get_verifying_key(&peer_id) {
                     let network_event = NetworkEvent {
@@ -362,19 +358,19 @@ impl LibP2PNetwork {
                     warn!("Received message from unknown peer: {}", peer_id);
                 }
             }
-            HotstuffEvent::MessageSent { peer_id, .. } => {
+            StreamEvent::MessageSent { peer_id } => {
                 debug!("Message sent successfully to peer: {}", peer_id);
             }
-            HotstuffEvent::SendFailed { peer_id, error } => {
+            StreamEvent::SendFailed { peer_id, error } => {
                 warn!("Failed to send message to peer {}: {}", peer_id, error);
             }
-            HotstuffEvent::PeerIdentified { peer_id } => {
+            StreamEvent::PeerIdentified { peer_id } => {
                 debug!("Peer identified: {}", peer_id);
             }
-            HotstuffEvent::ConnectionEstablished { peer_id } => {
+            StreamEvent::ConnectionEstablished { peer_id } => {
                 info!("Behaviour reported connection established: {}", peer_id);
             }
-            HotstuffEvent::ConnectionClosed { peer_id } => {
+            StreamEvent::ConnectionClosed { peer_id } => {
                 info!("Behaviour reported connection closed: {}", peer_id);
             }
         }
@@ -382,7 +378,7 @@ impl LibP2PNetwork {
 
     /// Handle send command
     async fn handle_send_command(
-        swarm: &mut Swarm<HotstuffBehaviour>,
+        swarm: &mut Swarm<StreamBehaviour>,
         peer: VerifyingKey,
         message: Message,
         config: &NetworkRuntimeConfig,
@@ -403,7 +399,7 @@ impl LibP2PNetwork {
 
     /// Handle broadcast command
     async fn handle_broadcast_command(
-        swarm: &mut Swarm<HotstuffBehaviour>,
+        swarm: &mut Swarm<StreamBehaviour>,
         message: Message,
     ) {
         let results = swarm.behaviour_mut().broadcast_message(message);
@@ -419,7 +415,7 @@ impl LibP2PNetwork {
 
     /// Handle reconnection attempts for disconnected peers
     async fn handle_reconnection_attempts(
-        swarm: &mut Swarm<HotstuffBehaviour>,
+        swarm: &mut Swarm<StreamBehaviour>,
         config: &NetworkRuntimeConfig,
     ) {
         let peers_to_reconnect = swarm.behaviour().peers_needing_reconnection();
