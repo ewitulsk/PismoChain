@@ -28,7 +28,7 @@ use hotstuff_rs::{
 
 use crate::{standards::book_executor::BookExecutor, transactions::Transaction};
 use crate::config::Config;
-use crate::jmt_state::{get_jmt_root, compute_jmt_updates, get_with_proof, PendingBlockState, LATEST_VERSION_KEY};
+use crate::jmt_state::{get_jmt_root, get_latest_jmt_root_before, compute_jmt_updates, get_with_proof, PendingBlockState, LATEST_VERSION_KEY};
 use hotstuff_rs::block_tree::pluggables::KVStore;
 use jmt::{KeyHash, RootHash, OwnedValue, proof::SparseMerkleProof};
 
@@ -215,6 +215,8 @@ impl<K: KVStore> App<K> for PismoAppJMT {
         let start_version = self.next_version;
         let last_version = start_version.saturating_sub(1);
         
+        // println!("🔧 Producing block: start_version={}, last_version={}", start_version, last_version);
+        
         let transactions_clone = {
             let mut tx_queue = self.tx_queue.lock().unwrap();
             // Clone transactions to avoid borrowing conflicts
@@ -223,13 +225,19 @@ impl<K: KVStore> App<K> for PismoAppJMT {
             transactions_clone
         };
         
-        // If no transactions, return early with no state changes
+        // If no transactions, return early with no state changes but advance version
         if transactions_clone.is_empty() {
             let block_tree = request.block_tree();
-            let previous_root = get_jmt_root(block_tree, last_version)
+            let previous_root = get_latest_jmt_root_before(block_tree, last_version)
                 .unwrap_or_else(|| RootHash([0u8; 32]));
-            let block_payload = BlockPayload::new(transactions_clone, previous_root, last_version, last_version);
+            
+            // For empty blocks, use start_version as both start and final version
+            // This maintains version consistency even with no transactions
+            let block_payload = BlockPayload::new(transactions_clone, previous_root, start_version, start_version);
             let serialized_payload = block_payload.try_to_vec().unwrap();
+            
+            // Important: Increment next_version even for empty blocks to maintain sync
+            self.next_version = start_version + 1;
             
             let data = Data::new(vec![Datum::new(serialized_payload)]);
             let data_hash = {
@@ -238,6 +246,8 @@ impl<K: KVStore> App<K> for PismoAppJMT {
                 let bytes = hasher.finalize().into();
                 CryptoHash::new(bytes)
             };
+
+            // println!("📦 Empty block produced: version={}, next_version={}, root={:?}", start_version, self.next_version, hex::encode(&previous_root.0[..8]));
 
             return ProduceBlockResponse {
                 data_hash,
@@ -258,6 +268,7 @@ impl<K: KVStore> App<K> for PismoAppJMT {
         
         // Advance the next_version counter for future blocks
         self.next_version = final_version + 1; //I REALLY don't like tracking 3 different version types.
+        println!("🔧 Non-empty block produced: final_version={}, next_version={}", final_version, self.next_version);
         
         // Create enhanced block payload with state root and final version
         let block_payload = BlockPayload::new(transactions_clone, state_root, start_version, final_version);
@@ -311,6 +322,9 @@ impl<K: KVStore> App<K> for PismoAppJMT {
             // Use the actual final version from the block payload
             let block_final_version = block_payload.final_version;
             let block_start_version = block_payload.start_version;
+            
+            println!("🔍 Validating block: start_version={}, final_version={}, tx_count={}", 
+                block_start_version, block_final_version, block_payload.transactions.len());
 
             // Validate all transactions in the block (signature, chain id, nonce)
             for transaction in &block_payload.transactions {
@@ -329,6 +343,20 @@ impl<K: KVStore> App<K> for PismoAppJMT {
                         return ValidateBlockResponse::Invalid;
                     }
                 }
+            }
+
+            // Special handling for empty blocks to maintain version consistency
+            if block_payload.transactions.is_empty() {
+                // For empty blocks, ensure validator version tracking matches producer
+                // Don't increment next_version since producer already did this
+                let expected_state_root = block_payload.state_root();
+                println!("✅ Empty block validated with state root: {:?} (version {})", expected_state_root, block_start_version);
+                
+                // Return without app_state_updates since no changes occurred
+                return ValidateBlockResponse::Valid {
+                    app_state_updates: None,
+                    validator_set_updates: None,
+                };
             }
 
             // Execute transactions with JMT and verify state root
@@ -406,8 +434,11 @@ impl PismoAppJMT {
             }
         } else {
             // No state changes, return previous root
-            let prev_root = get_jmt_root(block_tree, new_version)
+            // Look for root at the previous version (new_version - 1) since no changes occurred
+            let prev_version = new_version.saturating_sub(1);
+            let prev_root = get_latest_jmt_root_before(block_tree, prev_version)
                 .unwrap_or_else(|| RootHash([0u8; 32]));
+            println!("📋 No JMT changes, using latest root at/before version {}: {:?}", prev_version, hex::encode(&prev_root.0[..8]));
             (prev_root, AppStateUpdates::new())
         };
 

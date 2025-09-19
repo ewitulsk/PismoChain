@@ -123,7 +123,58 @@ export default function App() {
   const [tokenBalances, setTokenBalances] = useState<Record<string, { balance: string | null, coinStoreAddress: string }>>({})
   const [isQueryingBalances, setIsQueryingBalances] = useState<boolean>(false)
 
+  // Node endpoint configuration
+  const [nodeEndpoint, setNodeEndpoint] = useState<string>('http://127.0.0.1:9944')
+  const [isTestingConnection, setIsTestingConnection] = useState<boolean>(false)
+  const [nodeStatus, setNodeStatus] = useState<'unknown' | 'connected' | 'error'>('unknown')
+
   const signerStr = useMemo(() => pubkeyBase58 ? exampleSignerString(pubkeyBase58) : '', [pubkeyBase58])
+
+  // Helper function to make RPC calls with configurable endpoint
+  const makeRpcCall = useCallback(async (method: string, params: any) => {
+    const endpoint = nodeEndpoint.endsWith('/') ? nodeEndpoint.slice(0, -1) : nodeEndpoint
+    const url = endpoint.startsWith('http') ? endpoint : `http://${endpoint}`
+    
+    // Use the Vite proxy for ALL 127.0.0.1 connections to avoid CORS issues
+    const isLocalhost = url.includes('127.0.0.1') || url.includes('localhost')
+    const fetchUrl = isLocalhost ? '/rpc' : url
+    
+    // Log the URL being called for debugging
+    console.log(`🌐 Blockchain RPC Call: ${method} -> ${fetchUrl}${isLocalhost ? ` (proxying to ${url})` : ''}`)
+    
+    const response = await fetch(fetchUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method,
+        params,
+      }),
+    })
+    
+    return response
+  }, [nodeEndpoint])
+
+  // Test connection to the selected node
+  const testNodeConnection = useCallback(async () => {
+    setIsTestingConnection(true)
+    try {
+      const response = await makeRpcCall('view', { address: '0000000000000000000000000000000000000000000000000000000000000000', type: 'Account' })
+      if (response.ok) {
+        setNodeStatus('connected')
+        setStatus(`Connected to node: ${nodeEndpoint}`)
+      } else {
+        setNodeStatus('error')
+        setStatus(`Failed to connect to node: HTTP ${response.status}`)
+      }
+    } catch (e: any) {
+      setNodeStatus('error')
+      setStatus(`Connection error: ${e?.message || e}`)
+    } finally {
+      setIsTestingConnection(false)
+    }
+  }, [makeRpcCall, nodeEndpoint])
 
   // Function to query and update current nonce
   const refreshNonce = useCallback(async () => {
@@ -143,16 +194,20 @@ export default function App() {
 
       const hexAddr = Array.from(accountAddr).map(b => b.toString(16).padStart(2, '0')).join('')
       
-      const accountData = await viewQuery(hexAddr, 'Account')
-      if (accountData && accountData.current_nonce !== undefined) {
-        setCurrentNonce(BigInt(accountData.current_nonce))
-        console.log('Updated nonce to:', accountData.current_nonce)
+      const response = await makeRpcCall('view', { address: hexAddr, type: 'Account' })
+      if (response.ok) {
+        const json = await response.json()
+        const accountData = json.result
+        if (accountData && accountData.current_nonce !== undefined) {
+          setCurrentNonce(BigInt(accountData.current_nonce))
+          console.log('Updated nonce to:', accountData.current_nonce)
+        }
       }
     } catch (e) {
       console.warn('Could not refresh nonce:', e)
       // Keep current nonce if query fails
     }
-  }, [activeWalletType, pubkeyBytes, suiPubkeyBytes])
+  }, [activeWalletType, pubkeyBytes, suiPubkeyBytes, makeRpcCall])
 
   const onConnect = useCallback(async () => {
     setStatus('Connecting...')
@@ -210,16 +265,7 @@ export default function App() {
 
       // Submit to backend through proxy
       setStatus('Submitting to node...')
-      const res = await fetch('/rpc', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'submit_borsh_tx',
-          params: [base64Tx],
-        }),
-      })
+      const res = await makeRpcCall('submit_borsh_tx', [base64Tx])
 
       const json = await res.json().catch(() => ({}))
       setSubmitResult(json)
@@ -235,7 +281,7 @@ export default function App() {
       console.error(e)
       setStatus(`Error: ${e?.message || e}`)
     }
-  }, [pubkeyBytes, signerStr, signMessage, refreshNonce])
+  }, [pubkeyBytes, signerStr, signMessage, refreshNonce, makeRpcCall])
 
   const suiSignerStr = useMemo(() => (suiAddress ? `sui:${suiAddress}` : ''), [suiAddress])
 
@@ -316,16 +362,7 @@ export default function App() {
       const base64Tx = toBase64Borsh(txBytes)
 
       setStatus('Submitting to node...')
-      const res = await fetch('/rpc', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'submit_borsh_tx',
-          params: [base64Tx],
-        }),
-      })
+      const res = await makeRpcCall('submit_borsh_tx', [base64Tx])
 
       const json = await res.json().catch(() => ({}))
       setSubmitResult(json)
@@ -341,7 +378,7 @@ export default function App() {
       console.error(e)
       setStatus(`Error: ${e?.message || e}`)
     }
-  }, [suiPubkeyBytes, suiSignerStr, suiSignPersonalMessage, refreshNonce])
+  }, [suiPubkeyBytes, suiSignerStr, suiSignPersonalMessage, refreshNonce, makeRpcCall])
 
   const onCreateCoin = useCallback(async () => {
     try {
@@ -409,16 +446,7 @@ export default function App() {
 
       // Submit to backend
       setStatus('Submitting NewCoin transaction...')
-      const res = await fetch('/rpc', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'submit_borsh_tx',
-          params: [base64Tx],
-        }),
-      })
+      const res = await makeRpcCall('submit_borsh_tx', [base64Tx])
 
       const json = await res.json().catch(() => ({}))
       setSubmitResult(json)
@@ -433,7 +461,7 @@ export default function App() {
       console.error(e)
       setStatus(`Error: ${e?.message || e}`)
     }
-  }, [currentWallet, currentNonce, refreshNonce])
+  }, [currentWallet, currentNonce, refreshNonce, makeRpcCall])
 
   const onMint = useCallback(async () => {
     try {
@@ -490,16 +518,7 @@ export default function App() {
 
       // Submit to backend
       setStatus('Submitting Mint transaction...')
-      const res = await fetch('/rpc', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'submit_borsh_tx',
-          params: [base64Tx],
-        }),
-      })
+      const res = await makeRpcCall('submit_borsh_tx', [base64Tx])
 
       const json = await res.json().catch(() => ({}))
       setSubmitResult(json)
@@ -514,7 +533,7 @@ export default function App() {
       console.error(e)
       setStatus(`Error: ${e?.message || e}`)
     }
-  }, [currentWallet, coinAddress, currentNonce, refreshNonce])
+  }, [currentWallet, coinAddress, currentNonce, refreshNonce, makeRpcCall])
 
   const onTransfer = useCallback(async () => {
     try {
@@ -589,16 +608,7 @@ export default function App() {
 
       // Submit to backend
       setStatus('Submitting Transfer transaction...')
-      const res = await fetch('/rpc', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'submit_borsh_tx',
-          params: [base64Tx],
-        }),
-      })
+      const res = await makeRpcCall('submit_borsh_tx', [base64Tx])
 
       const json = await res.json().catch(() => ({}))
       setSubmitResult(json)
@@ -618,7 +628,7 @@ export default function App() {
       console.error(e)
       setStatus(`Error: ${e?.message || e}`)
     }
-  }, [currentWallet, transferCoinAddress, transferReceiverAddress, transferAmount, currentNonce, refreshNonce])
+  }, [currentWallet, transferCoinAddress, transferReceiverAddress, transferAmount, currentNonce, refreshNonce, makeRpcCall])
 
   const onCreateOrderbook = useCallback(async () => {
     try {
@@ -672,16 +682,7 @@ export default function App() {
 
       // Submit to backend
       setStatus('Submitting CreateOrderbook transaction...')
-      const res = await fetch('/rpc', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'submit_borsh_tx',
-          params: [base64Tx],
-        }),
-      })
+      const res = await makeRpcCall('submit_borsh_tx', [base64Tx])
 
       const json = await res.json().catch(() => ({}))
       setSubmitResult(json)
@@ -703,7 +704,7 @@ export default function App() {
       console.error(e)
       setStatus(`Error: ${e?.message || e}`)
     }
-  }, [currentWallet, orderbookBuyAsset, orderbookSellAsset, currentNonce, refreshNonce])
+  }, [currentWallet, orderbookBuyAsset, orderbookSellAsset, currentNonce, refreshNonce, makeRpcCall])
 
   const onPlaceLimitOrder = useCallback(async () => {
     try {
@@ -766,16 +767,7 @@ export default function App() {
 
       // Submit to backend
       setStatus('Submitting NewLimitOrder transaction...')
-      const res = await fetch('/rpc', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'submit_borsh_tx',
-          params: [base64Tx],
-        }),
-      })
+      const res = await makeRpcCall('submit_borsh_tx', [base64Tx])
 
       const json = await res.json().catch(() => ({}))
       setSubmitResult(json)
@@ -790,7 +782,7 @@ export default function App() {
       console.error(e)
       setStatus(`Error: ${e?.message || e}`)
     }
-  }, [currentWallet, limitOrderOrderbookAddress, limitOrderIsBuy, limitOrderAmount, limitOrderTickPrice, currentNonce, refreshNonce])
+  }, [currentWallet, limitOrderOrderbookAddress, limitOrderIsBuy, limitOrderAmount, limitOrderTickPrice, currentNonce, refreshNonce, makeRpcCall])
 
   const onDisconnectWallet = useCallback(() => {
     setActiveWalletType(null)
@@ -871,7 +863,8 @@ export default function App() {
           const coinStoreHex = Array.from(coinStoreAddr).map(b => b.toString(16).padStart(2, '0')).join('')
           
           // Query the coinstore
-          const result = await viewQuery(coinStoreHex, 'CoinStore')
+          const response = await makeRpcCall('view', { address: coinStoreHex, type: 'CoinStore' })
+          const result = response.ok ? (await response.json()).result : null
           
           balanceResults[tokenAddr] = {
             balance: result?.amount?.toString() ?? null, // null means coinstore doesn't exist (0 balance)
@@ -894,7 +887,7 @@ export default function App() {
     } finally {
       setIsQueryingBalances(false)
     }
-  }, [currentWallet, tokenAddresses])
+  }, [currentWallet, tokenAddresses, makeRpcCall])
 
 
 
@@ -911,12 +904,16 @@ export default function App() {
           throw new Error('Connect a wallet to query links')
         }
         
-        result = await viewQuery(viewAddress.trim(), viewType, {
+        const response = await makeRpcCall('view', {
+          address: viewAddress.trim(),
+          type: viewType,
           signature_type: currentWallet.signatureType,
           external_address: viewAddress.trim()
         })
+        result = response.ok ? (await response.json()).result : null
       } else {
-        result = await viewQuery(viewAddress.trim(), viewType)
+        const response = await makeRpcCall('view', { address: viewAddress.trim(), type: viewType })
+        result = response.ok ? (await response.json()).result : null
       }
       
       console.log('View query result:', result)
@@ -927,7 +924,7 @@ export default function App() {
       setStatus(`Query error: ${e?.message || e}`)
       setViewResult(undefined)
     }
-  }, [viewAddress, viewType, currentWallet])
+  }, [viewAddress, viewType, currentWallet, makeRpcCall])
 
   // Helper to populate view address with useful addresses
   const populateAccountAddress = useCallback(() => {
@@ -979,6 +976,60 @@ export default function App() {
 
   return (
     <div style={{ fontFamily: 'Inter, system-ui, sans-serif', padding: 24, lineHeight: 1.5, maxWidth: 720 }}>
+      {/* Node Configuration Section */}
+      <div style={{ marginBottom: 24, padding: 16, border: '1px solid #e1e5e9', borderRadius: 8, background: '#f8f9fa' }}>
+        <h3 style={{ margin: '0 0 16px 0', fontSize: '16px' }}>Blockchain Node Configuration</h3>
+        
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 12 }}>
+          <label style={{ minWidth: '120px', fontSize: '14px' }}>Node Endpoint:</label>
+          <input
+            type="text"
+            placeholder="Enter node endpoint (e.g., http://127.0.0.1:9944)"
+            value={nodeEndpoint}
+            onChange={(e) => setNodeEndpoint(e.target.value)}
+            style={{ 
+              flex: 1, 
+              padding: '6px 8px', 
+              border: '1px solid #ccc', 
+              borderRadius: 4, 
+              fontSize: '14px',
+              fontFamily: 'monospace'
+            }}
+          />
+          <button 
+            onClick={testNodeConnection}
+            disabled={isTestingConnection || !nodeEndpoint.trim()}
+            style={{ 
+              padding: '6px 12px', 
+              backgroundColor: isTestingConnection || !nodeEndpoint.trim() ? '#f0f0f0' : '#007bff', 
+              color: isTestingConnection || !nodeEndpoint.trim() ? '#666' : 'white',
+              border: 'none', 
+              borderRadius: 4, 
+              cursor: isTestingConnection || !nodeEndpoint.trim() ? 'not-allowed' : 'pointer',
+              fontSize: '14px',
+              minWidth: '80px'
+            }}
+          >
+            {isTestingConnection ? 'Testing...' : 'Test'}
+          </button>
+        </div>
+        
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '14px' }}>
+          <span><strong>Status:</strong></span>
+          <span style={{ 
+            color: nodeStatus === 'connected' ? '#28a745' : nodeStatus === 'error' ? '#dc3545' : '#6c757d',
+            fontWeight: 'bold'
+          }}>
+            {nodeStatus === 'connected' ? '✅ Connected' : nodeStatus === 'error' ? '❌ Error' : '⚪ Unknown'}
+          </span>
+          {nodeStatus === 'connected' && (
+            <span style={{ color: '#6c757d', fontSize: '12px' }}>
+              ({nodeEndpoint})
+            </span>
+          )}
+        </div>
+      </div>
+
       <h2>Pismo CreateAccount via Phantom</h2>
       <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
         <button onClick={onConnect} disabled={!ready}>
@@ -1569,7 +1620,7 @@ export default function App() {
 
       <hr style={{ margin: '24px 0' }} />
 
-      <OrderbookVisualizer initialOrderbookAddress={createdOrderbookAddress} />
+      <OrderbookVisualizer initialOrderbookAddress={createdOrderbookAddress} makeRpcCall={makeRpcCall} />
 
       <hr style={{ margin: '24px 0' }} />
 

@@ -3,16 +3,17 @@ use std::{
     io,
     task::{Context, Poll},
 };
-use futures::{AsyncReadExt, AsyncWriteExt, future::BoxFuture, FutureExt};
+use futures::{AsyncReadExt, AsyncWriteExt, future::BoxFuture, FutureExt, future::{Ready, ready}};
 use libp2p::{
-    core::upgrade::ReadyUpgrade,
+    core::upgrade::{InboundUpgrade, OutboundUpgrade, UpgradeInfo},
     swarm::{
-        handler::{ConnectionEvent, DialUpgradeError, FullyNegotiatedInbound, FullyNegotiatedOutbound},
+        handler::{ConnectionEvent, DialUpgradeError, FullyNegotiatedInbound, FullyNegotiatedOutbound, ListenUpgradeError},
         ConnectionHandler, ConnectionHandlerEvent, SubstreamProtocol,
     },
     Stream,
 };
 use hotstuff_rs::networking::messages::Message;
+use tracing::{debug, error, warn, info};
 
 /// Protocol name for hotstuff messages
 #[derive(Debug, Clone)]
@@ -21,6 +22,37 @@ pub struct HotstuffStreamProtocol;
 impl AsRef<str> for HotstuffStreamProtocol {
     fn as_ref(&self) -> &str {
         "/hotstuff/stream/1.0.0"
+    }
+}
+
+impl UpgradeInfo for HotstuffStreamProtocol {
+    type Info = &'static str;
+    type InfoIter = std::iter::Once<Self::Info>;
+
+    fn protocol_info(&self) -> Self::InfoIter {
+        std::iter::once("/hotstuff/stream/1.0.0")
+    }
+}
+
+impl InboundUpgrade<libp2p::Stream> for HotstuffStreamProtocol {
+    type Output = libp2p::Stream;
+    type Error = std::io::Error;
+    type Future = Ready<Result<Self::Output, Self::Error>>;
+
+    fn upgrade_inbound(self, socket: libp2p::Stream, _info: Self::Info) -> Self::Future {
+        // For a simple stream protocol, just return the stream as-is
+        ready(Ok(socket))
+    }
+}
+
+impl OutboundUpgrade<libp2p::Stream> for HotstuffStreamProtocol {
+    type Output = libp2p::Stream;
+    type Error = std::io::Error;
+    type Future = Ready<Result<Self::Output, Self::Error>>;
+
+    fn upgrade_outbound(self, socket: libp2p::Stream, _info: Self::Info) -> Self::Future {
+        // For a simple stream protocol, just return the stream as-is
+        ready(Ok(socket))
     }
 }
 
@@ -97,6 +129,10 @@ pub struct HotstuffStreamHandler {
     outbound_stream: Option<StreamState>,
     /// Events to emit
     pending_events: VecDeque<HandlerOutEvent>,
+    /// Whether we're currently requesting an outbound stream
+    requesting_outbound: bool,
+    /// Keep connection alive
+    keep_alive: bool,
 }
 
 impl HotstuffStreamHandler {
@@ -106,6 +142,8 @@ impl HotstuffStreamHandler {
             inbound_stream: None,
             outbound_stream: None,
             pending_events: VecDeque::new(),
+            requesting_outbound: false,
+            keep_alive: true,
         }
     }
     
@@ -157,27 +195,29 @@ impl HotstuffStreamHandler {
 impl ConnectionHandler for HotstuffStreamHandler {
     type FromBehaviour = HandlerInEvent;
     type ToBehaviour = HandlerOutEvent;
-    type InboundProtocol = ReadyUpgrade<HotstuffStreamProtocol>;
-    type OutboundProtocol = ReadyUpgrade<HotstuffStreamProtocol>;
+    type InboundProtocol = HotstuffStreamProtocol;
+    type OutboundProtocol = HotstuffStreamProtocol;
     type InboundOpenInfo = ();
     type OutboundOpenInfo = ();
     
     fn listen_protocol(&self) -> SubstreamProtocol<Self::InboundProtocol, Self::InboundOpenInfo> {
-        SubstreamProtocol::new(ReadyUpgrade::new(HotstuffStreamProtocol), ())
+        SubstreamProtocol::new(HotstuffStreamProtocol, ())
     }
     
     fn on_behaviour_event(&mut self, event: Self::FromBehaviour) {
         match event {
             HandlerInEvent::SendMessage(message) => {
+                //info!("🚀 StreamHandler::on_behaviour_event - SendMessage");
+                //info!("🚀 Message type: {:?}", std::mem::discriminant(&message));
+                //info!("🚀 Outbound queue size before: {}", self.outbound_queue.len());
                 self.outbound_queue.push_back(message);
+                //info!("🚀 Outbound queue size after: {}", self.outbound_queue.len());
             }
         }
     }
     
     fn connection_keep_alive(&self) -> bool {
-        // Always keep connections alive for consensus protocol
-        // HotStuff needs persistent connections to avoid reconnection overhead
-        true
+        self.keep_alive || !self.outbound_queue.is_empty() || self.inbound_stream.is_some() || self.outbound_stream.is_some()
     }
     
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<ConnectionHandlerEvent<Self::OutboundProtocol, Self::OutboundOpenInfo, Self::ToBehaviour>> {
@@ -197,6 +237,8 @@ impl ConnectionHandler for HotstuffStreamHandler {
                 StreamState::Receiving { mut future } => {
                     match future.poll_unpin(cx) {
                         Poll::Ready(Ok((stream, message))) => {
+                            //info!("📨 StreamHandler: Successfully received and decoded message");
+                            //info!("📨 Received message type: {:?}", std::mem::discriminant(&message));
                             self.pending_events.push_back(HandlerOutEvent::MessageReceived(message));
                             self.inbound_stream = Some(StreamState::PendingReceive { stream });
                             cx.waker().wake_by_ref();
@@ -233,6 +275,7 @@ impl ConnectionHandler for HotstuffStreamHandler {
                 StreamState::Sending { mut future } => {
                     match future.poll_unpin(cx) {
                         Poll::Ready(Ok(stream)) => {
+                            //info!("📤 StreamHandler: Successfully sent message over wire");
                             self.pending_events.push_back(HandlerOutEvent::MessageSent);
                             self.outbound_stream = Some(StreamState::Idle(stream));
                             cx.waker().wake_by_ref();
@@ -241,10 +284,11 @@ impl ConnectionHandler for HotstuffStreamHandler {
                             self.pending_events.push_back(HandlerOutEvent::SendError(e));
                             self.outbound_stream = None;
                             
-                            // Request new outbound stream if we have more messages
-                            if !self.outbound_queue.is_empty() {
+                            // Request new outbound stream if we have more messages and not already requesting
+                            if !self.outbound_queue.is_empty() && !self.requesting_outbound {
+                                self.requesting_outbound = true;
                                 return Poll::Ready(ConnectionHandlerEvent::OutboundSubstreamRequest {
-                                    protocol: SubstreamProtocol::new(ReadyUpgrade::new(HotstuffStreamProtocol), ()),
+                                    protocol: SubstreamProtocol::new(HotstuffStreamProtocol, ()),
                                 });
                             }
                         }
@@ -255,10 +299,11 @@ impl ConnectionHandler for HotstuffStreamHandler {
                 }
                 other => self.outbound_stream = Some(other),
             }
-        } else if !self.outbound_queue.is_empty() {
-            // Request new outbound stream
+        } else if !self.outbound_queue.is_empty() && !self.requesting_outbound {
+            // Request new outbound stream only if we're not already requesting one
+            self.requesting_outbound = true;
             return Poll::Ready(ConnectionHandlerEvent::OutboundSubstreamRequest {
-                protocol: SubstreamProtocol::new(ReadyUpgrade::new(HotstuffStreamProtocol), ()),
+                protocol: SubstreamProtocol::new(HotstuffStreamProtocol, ()),
             });
         }
         
@@ -271,14 +316,24 @@ impl ConnectionHandler for HotstuffStreamHandler {
                 self.inbound_stream = Some(StreamState::PendingReceive { stream: protocol });
             }
             ConnectionEvent::FullyNegotiatedOutbound(FullyNegotiatedOutbound { protocol, .. }) => {
+                self.requesting_outbound = false; // Reset the requesting flag
                 self.outbound_stream = Some(StreamState::Idle(protocol));
             }
             ConnectionEvent::DialUpgradeError(DialUpgradeError { error, .. }) => {
+                self.requesting_outbound = false; // Reset the requesting flag on error
                 self.pending_events.push_back(HandlerOutEvent::SendError(
                     io::Error::new(io::ErrorKind::ConnectionAborted, error.to_string())
                 ));
+            },
+            ConnectionEvent::ListenUpgradeError(ListenUpgradeError { error, .. }) => {
+                error!("❌ Inbound substream upgrade failed: {}", error);
+                self.pending_events.push_back(HandlerOutEvent::ReceiveError(
+                    io::Error::new(io::ErrorKind::ConnectionAborted, error.to_string())
+                ));
             }
-            _ => {}
+            _ => {
+                debug!("Other connection event: {:?}", std::mem::discriminant(&event));
+            }
         }
     }
 }

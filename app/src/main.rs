@@ -231,7 +231,8 @@ async fn main() {
         .progress_msg_buffer_capacity(BufferSize::new(1024))
         .epoch_length(EpochLength::new(50))
         .max_view_time(Duration::from_millis(2000)) // Match test timing requirements
-        .log_events(true) // Enable consensus logs for debugging
+        // .log_events(true) // Enable consensus logs for debugging
+        .log_events(false)
         .build();
 
     // Add debug logging for consensus
@@ -328,7 +329,7 @@ async fn main() {
         };
         
         // Create LibP2P network
-        let network = match LibP2PNetwork::new(libp2p_keypair, runtime_config).await {
+        let network = match LibP2PNetwork::new(libp2p_keypair, runtime_config, verifying_key).await {
             Ok(network) => network,
             Err(e) => {
                 eprintln!("❌ Failed to initialize LibP2P network: {}", e);
