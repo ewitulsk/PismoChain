@@ -31,6 +31,10 @@ pub struct NetworkConfig {
     pub max_retry_attempts: Option<u32>,
     /// Retry backoff base duration in milliseconds
     pub retry_backoff_base_ms: Option<u64>,
+    /// Substream creation timeout in seconds
+    pub substream_timeout: Option<u64>,
+    /// Protocol handshake timeout in seconds
+    pub handshake_timeout: Option<u64>,
 }
 
 impl Default for NetworkConfig {
@@ -38,11 +42,13 @@ impl Default for NetworkConfig {
         Self {
             validators: Vec::new(),
             listen_addresses: vec!["/ip4/0.0.0.0/udp/0/quic-v1".to_string()],
-            connection_timeout: Some(30),
+            connection_timeout: Some(20),
             max_connections_per_peer: Some(1),
             message_queue_size: Some(1000),
-            max_retry_attempts: Some(5),
-            retry_backoff_base_ms: Some(1000),
+            max_retry_attempts: Some(3),
+            retry_backoff_base_ms: Some(500),
+            substream_timeout: Some(10),
+            handshake_timeout: Some(15),
         }
     }
 }
@@ -68,6 +74,10 @@ pub struct NetworkRuntimeConfig {
     pub max_retry_attempts: u32,
     /// Retry backoff base duration
     pub retry_backoff_base: Duration,
+    /// Substream creation timeout
+    pub substream_timeout: Duration,
+    /// Protocol handshake timeout
+    pub handshake_timeout: Duration,
 }
 
 impl NetworkRuntimeConfig {
@@ -114,11 +124,13 @@ impl NetworkRuntimeConfig {
             peer_id_to_verifying_key,
             peer_addresses,
             listen_addresses,
-            connection_timeout: Duration::from_secs(config.connection_timeout.unwrap_or(30)),
+            connection_timeout: Duration::from_secs(config.connection_timeout.unwrap_or(20)),
             max_connections_per_peer: config.max_connections_per_peer.unwrap_or(1),
             message_queue_size: config.message_queue_size.unwrap_or(1000),
-            max_retry_attempts: config.max_retry_attempts.unwrap_or(5),
-            retry_backoff_base: Duration::from_millis(config.retry_backoff_base_ms.unwrap_or(1000)),
+            max_retry_attempts: config.max_retry_attempts.unwrap_or(3),
+            retry_backoff_base: Duration::from_millis(config.retry_backoff_base_ms.unwrap_or(500)),
+            substream_timeout: Duration::from_secs(config.substream_timeout.unwrap_or(10)),
+            handshake_timeout: Duration::from_secs(config.handshake_timeout.unwrap_or(15)),
         })
     }
 

@@ -5,7 +5,6 @@ use std::{
 };
 
 use libp2p::{
-    identify::{self, Behaviour as IdentifyBehaviour},
     swarm::{NetworkBehaviour, ToSwarm, ConnectionId, THandlerInEvent, THandlerOutEvent, THandler},
     PeerId, Multiaddr,
 };
@@ -19,6 +18,7 @@ use crate::networking::{
     config::NetworkRuntimeConfig,
     stream_handler::{HotstuffStreamHandler, HandlerInEvent, HandlerOutEvent},
 };
+use tracing::{debug, warn, info};
 
 /// Events emitted by the StreamBehaviour
 pub enum StreamEvent {
@@ -61,10 +61,8 @@ pub struct ConnectionState {
     pub next_retry: Option<Instant>,
 }
 
-/// Custom NetworkBehaviour for Hotstuff consensus using streams
+/// Pure NetworkBehaviour for Hotstuff consensus using streams
 pub struct StreamBehaviour {
-    /// Identify protocol for peer discovery and metadata
-    identify: IdentifyBehaviour,
     /// Configuration
     config: NetworkRuntimeConfig,
     /// Connection state tracking
@@ -81,15 +79,8 @@ impl StreamBehaviour {
     /// Create a new StreamBehaviour
     pub fn new(
         local_peer_id: PeerId,
-        local_public_key: libp2p::identity::PublicKey,
         config: NetworkRuntimeConfig,
     ) -> Self {
-        // Use the actual public key for the identify protocol
-        let identify = IdentifyBehaviour::new(identify::Config::new(
-            "/hotstuff/stream/1.0.0".to_string(),
-            local_public_key,
-        ));
-
         let mut connections = HashMap::new();
         let now = Instant::now();
         
@@ -110,7 +101,6 @@ impl StreamBehaviour {
         }
 
         Self {
-            identify,
             config,
             connections,
             message_queue: HashMap::new(),
@@ -121,28 +111,37 @@ impl StreamBehaviour {
 
     /// Send a message to a specific peer
     pub fn send_message(&mut self, peer_id: PeerId, message: Message) -> Result<(), String> {
+        //info!("🎯 StreamBehaviour::send_message to peer_id: {}", peer_id);
+        //info!("🎯 Message type: {:?}", std::mem::discriminant(&message));
+        
         // Check if peer is known
         if !self.config.peer_id_to_verifying_key.contains_key(&peer_id) {
+            warn!("❌ Unknown peer: {}", peer_id);
             return Err(format!("Unknown peer: {}", peer_id));
         }
 
-        // Check connection state
-        if let Some(conn_state) = self.connections.get(&peer_id) {
-            if !conn_state.connected {
-                // Queue message for later delivery
-                let queue = self.message_queue.entry(peer_id).or_insert_with(VecDeque::new);
-                if queue.len() >= self.config.message_queue_size {
-                    queue.pop_front(); // Drop oldest message
-                }
-                queue.push_back(message);
-                return Err(format!("Peer {} not connected, message queued", peer_id));
-            }
+        // ALWAYS queue the message, regardless of connection state
+        let queue = self.message_queue.entry(peer_id).or_insert_with(VecDeque::new);
+        if queue.len() >= self.config.message_queue_size {
+            warn!("📤 Message queue full for peer {}, dropping oldest message", peer_id);
+            queue.pop_front(); // Drop oldest message
         }
+        queue.push_back(message);
+        //info!("📤 Message queued for peer {}, queue size: {}", peer_id, queue.len());
 
-        // Queue the event to send to the handler
-        self.pending_events.push_back(StreamEvent::MessageSent { peer_id });
-        
-        Ok(())
+        // Return appropriate status based on connection state
+        if let Some(conn_state) = self.connections.get(&peer_id) {
+            if conn_state.connected {
+                //info!("✅ Peer {} is connected, message will be sent by poll()", peer_id);
+                Ok(()) // Will be sent immediately by poll()
+            } else {
+                //info!("⏳ Peer {} not connected, message queued for later", peer_id);
+                Err(format!("Peer {} not connected, message queued", peer_id))
+            }
+        } else {
+            //info!("⏳ No connection state for peer {}, message queued", peer_id);
+            Err(format!("Peer {} not connected, message queued", peer_id))
+        }
     }
 
     /// Broadcast a message to all connected peers
@@ -269,9 +268,6 @@ impl NetworkBehaviour for StreamBehaviour {
     }
 
     fn on_swarm_event(&mut self, event: libp2p::swarm::FromSwarm) {
-        // Also delegate to identify behaviour
-        self.identify.on_swarm_event(event);
-        
         // Handle connection events
         match event {
             libp2p::swarm::FromSwarm::ConnectionEstablished(ev) => {
@@ -321,7 +317,7 @@ impl NetworkBehaviour for StreamBehaviour {
 
     fn poll(
         &mut self,
-        cx: &mut Context<'_>,
+        _cx: &mut Context<'_>,
     ) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
         // First, check if we have any pending events
         if let Some(event) = self.pending_events.pop_front() {
@@ -356,32 +352,6 @@ impl NetworkBehaviour for StreamBehaviour {
             }
         }
         
-        // Poll identify behaviour
-        if let Poll::Ready(event) = self.identify.poll(cx) {
-            match event {
-                ToSwarm::GenerateEvent(id_event) => {
-                    let stream_event = match id_event {
-                        identify::Event::Received { peer_id, .. } => {
-                            StreamEvent::PeerIdentified { peer_id }
-                        }
-                        identify::Event::Sent { peer_id, .. } => {
-                            StreamEvent::PeerIdentified { peer_id }
-                        }
-                        identify::Event::Pushed { peer_id, .. } => {
-                            StreamEvent::PeerIdentified { peer_id }
-                        }
-                        identify::Event::Error { peer_id, error } => {
-                            StreamEvent::SendFailed {
-                                peer_id,
-                                error: error.to_string(),
-                            }
-                        }
-                    };
-                    return Poll::Ready(ToSwarm::GenerateEvent(stream_event));
-                }
-                _ => {} // Handle other events by continuing
-            }
-        }
         
         Poll::Pending
     }

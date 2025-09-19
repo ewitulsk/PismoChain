@@ -1,5 +1,4 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react'
-import { viewQuery } from '../lib/pismo'
 
 // TypeScript interfaces matching the backend structures
 interface Order {
@@ -32,9 +31,10 @@ interface ProcessedOrder {
 
 interface OrderbookVisualizerProps {
   initialOrderbookAddress?: string
+  makeRpcCall: (method: string, params: any) => Promise<Response>
 }
 
-export default function OrderbookVisualizer({ initialOrderbookAddress = '' }: OrderbookVisualizerProps) {
+export default function OrderbookVisualizer({ initialOrderbookAddress = '', makeRpcCall }: OrderbookVisualizerProps) {
   const [orderbookAddress, setOrderbookAddress] = useState<string>(initialOrderbookAddress)
   const [orderbook, setOrderbook] = useState<Orderbook | null>(null)
   const [loading, setLoading] = useState<boolean>(false)
@@ -50,15 +50,23 @@ export default function OrderbookVisualizer({ initialOrderbookAddress = '' }: Or
       setLoading(true)
       setError('')
       
-      const result = await viewQuery(orderbookAddress.trim(), 'Orderbook')
+      const response = await makeRpcCall('view', { address: orderbookAddress.trim(), type: 'Orderbook' })
       
-      if (result === null) {
-        setError('Orderbook not found')
-        setOrderbook(null)
+      if (response.ok) {
+        const json = await response.json()
+        const result = json.result
+        
+        if (result === null) {
+          setError('Orderbook not found')
+          setOrderbook(null)
+        } else {
+          setOrderbook(result as Orderbook)
+          setLastUpdated(new Date())
+          setError('') // Clear any previous errors
+        }
       } else {
-        setOrderbook(result as Orderbook)
-        setLastUpdated(new Date())
-        setError('') // Clear any previous errors
+        setError(`Query failed: HTTP ${response.status}`)
+        setOrderbook(null)
       }
     } catch (e: any) {
       setError(`Query failed: ${e?.message || e}`)
@@ -66,7 +74,7 @@ export default function OrderbookVisualizer({ initialOrderbookAddress = '' }: Or
     } finally {
       setLoading(false)
     }
-  }, [orderbookAddress])
+  }, [orderbookAddress, makeRpcCall])
 
   // Auto-refresh effect
   useEffect(() => {

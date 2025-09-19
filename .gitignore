@@ -23,3 +23,5 @@ Thumbs.db
 data/*
 
 validator.keys
+validator2.keys
+*.keys

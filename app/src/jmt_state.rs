@@ -225,6 +225,28 @@ pub fn get_jmt_root<K: KVStore>(
         .map(|bytes| RootHash(bytes.as_slice().try_into().unwrap_or([0u8; 32])))
 }
 
+/// Get the latest available JMT root at or before the specified version
+/// This handles cases where a specific version's root doesn't exist by walking back
+pub fn get_latest_jmt_root_before<K: KVStore>(
+    block_tree: &AppBlockTreeView<K>,
+    max_version: Version,
+) -> Option<RootHash> {
+    // Try the exact version first
+    if let Some(root) = get_jmt_root(block_tree, max_version) {
+        return Some(root);
+    }
+    
+    // Walk backwards from max_version to find the most recent available root
+    for version in (0..=max_version).rev() {
+        if let Some(root) = get_jmt_root(block_tree, version) {
+            return Some(root);
+        }
+    }
+    
+    // If no root found, return None (caller should handle with default)
+    None
+}
+
 /// Get a JMT value for a specific version from committed app state
 pub fn get_jmt_value<K: KVStore>(
     block_tree: &AppBlockTreeView<K>,

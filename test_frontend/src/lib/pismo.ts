@@ -635,7 +635,7 @@ export function deriveOrderbookAddr(buyAssetAddr: Uint8Array, sellAssetAddr: Uin
   return sha3_256(combined)
 }
 
-// View query helper
+// View query helper (deprecated - use makeRpcCall from App component instead)
 export async function viewQuery(address: string, type: string, additionalParams?: { signature_type?: number, external_address?: string }): Promise<any> {
   const params: any = { address, type }
   
