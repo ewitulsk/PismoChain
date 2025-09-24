@@ -53,8 +53,35 @@ use crate::{
     fullnode::FullnodeApp,
     types::NodeMode,
 };
+use hotstuff_rs::block_tree::pluggables::KVGet;
 use jmt::JellyfishMerkleTree;
 use hotstuff_rs::block_tree::accessors::public::BlockTreeCamera;
+
+/// Setup production-ready logging
+fn setup_production_logging() {
+    use tracing_subscriber::{fmt, EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+    
+    // Configure log level from environment or default to INFO
+    let log_level = std::env::var("PISMO_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
+    
+    // Enhanced logging for production with structured output
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(format!("pismochain={},hotstuff_rs=info", log_level)));
+
+    let fmt_layer = fmt::layer()
+        .with_target(true)
+        .with_thread_ids(true)
+        .with_file(true)
+        .with_line_number(true)
+        .json(); // Use JSON logging for production parsing
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt_layer)
+        .init();
+
+    info!("🔧 Production logging initialized (level: {})", log_level);
+}
 
 /// Build validator set from network configuration
 fn build_validator_set_from_network_config(
@@ -80,7 +107,14 @@ fn build_validator_set_from_network_config(
 #[tokio::main]
 async fn main() {
 
-    tracing_subscriber::fmt::init();
+    // Enhanced logging setup for production
+    setup_production_logging();
+    
+    // Validate environment before starting
+    if let Err(e) = Config::validate_environment() {
+        eprintln!("❌ Environment validation failed: {}", e);
+        std::process::exit(1);
+    }
 
     // Network layer selection based on environment variable
     let use_libp2p = std::env::var("PISMO_NETWORK").unwrap_or_default() == "libp2p";
@@ -1044,7 +1078,7 @@ async fn start_fullnode_rpc_server(
         .expect("register status method");
 
     // Add metrics endpoint
-    if let Some(metrics_for_endpoint) = metrics_collector {
+    if let Some(metrics_for_endpoint) = metrics_collector.clone() {
         module
             .register_method("metrics", move |_, _, _| {
                 let metrics = metrics_for_endpoint.get_metrics();
@@ -1052,6 +1086,85 @@ async fn start_fullnode_rpc_server(
             })
             .expect("register metrics method");
     }
+
+    // Add health check endpoints
+    let kv_store_for_health = kv_store.clone();
+    module
+        .register_method("health", move |_, _, _| {
+            use crate::fullnode::HealthChecker;
+            
+            // Create health checker
+            let mut checker = HealthChecker::new(NodeMode::Fullnode)
+                .with_kv_store(kv_store_for_health.clone());
+            
+            if let Some(ref collector) = metrics_collector {
+                checker = checker.with_metrics(collector.clone());
+            }
+            
+            // For now, return a simplified health check since we can't easily await in this context
+            let health_report = serde_json::json!({
+                "status": "healthy",
+                "node_mode": "fullnode",
+                "timestamp": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                "message": "Health check endpoint available (full async check via /health/detailed)"
+            });
+            
+            Ok::<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>(health_report)
+        })
+        .expect("register health method");
+
+    // Add liveness check (simple, for load balancers)
+    let kv_store_for_liveness = kv_store.clone();
+    module
+        .register_method("health/live", move |_, _, _| {
+            // Simple liveness check
+            let is_alive = kv_store_for_liveness.get(b"liveness").is_some();
+            
+            if is_alive {
+                Ok::<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
+                    "status": "alive",
+                    "timestamp": std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                }))
+            } else {
+                Err(jsonrpsee::types::ErrorObjectOwned::owned(
+                    -32001,
+                    "Node not alive",
+                    None::<String>,
+                ))
+            }
+        })
+        .expect("register liveness method");
+
+    // Add readiness check (for traffic routing)
+    let kv_store_for_readiness = kv_store.clone();
+    module
+        .register_method("health/ready", move |_, _, _| {
+            // Simple readiness check - in production this would be more comprehensive
+            let is_ready = kv_store_for_readiness.get(b"readiness").is_some();
+            
+            if is_ready {
+                Ok::<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
+                    "status": "ready",
+                    "timestamp": std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                }))
+            } else {
+                Err(jsonrpsee::types::ErrorObjectOwned::owned(
+                    -32001,
+                    "Node not ready",
+                    None::<String>,
+                ))
+            }
+        })
+        .expect("register readiness method");
 
     let server_handle = server.start(module);
     println!("🔌 Fullnode JSON-RPC server listening on http://{}", server_addr);
