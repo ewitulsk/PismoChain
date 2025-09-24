@@ -43,7 +43,7 @@ use jsonrpsee::server::ServerBuilder;
 use jsonrpsee::RpcModule;
  
 use tokio::signal;
-use tracing::{info, error, debug};
+use tracing::{info, error, debug, warn};
 
 use crate::{
     database::rocks_db::RocksDBStore,
@@ -480,6 +480,43 @@ async fn run_validator_mode(
     }
     println!("================================================================");
 
+    // Set up periodic snapshot creation for validators
+    let snapshot_config = crate::fullnode::SnapshotConfig::default();
+    let snapshot_manager = match crate::fullnode::SnapshotManager::new(snapshot_config, kv_store_for_rpc.clone()) {
+        Ok(manager) => manager,
+        Err(e) => {
+            warn!("⚠️ Failed to initialize snapshot manager: {}, continuing without snapshots", e);
+            start_rpc_server(tx_queue, config, kv_store_for_rpc.clone(), &server_port).await;
+            return;
+        }
+    };
+    
+    // Spawn snapshot creation task
+    tokio::spawn(async move {
+        info!("📸 Starting periodic snapshot creation for validator");
+        let mut snapshot_interval = tokio::time::interval(Duration::from_secs(300)); // Every 5 minutes
+        
+        loop {
+            snapshot_interval.tick().await;
+            
+            // Get current block height (simplified - in practice get from block tree)
+            let current_height = 1000; // Placeholder
+            let current_version = 1000; // Placeholder
+            
+            if snapshot_manager.should_create_snapshot(current_height) {
+                match snapshot_manager.create_snapshot(current_height, current_version) {
+                    Ok(metadata) => {
+                        info!("📸 Created snapshot at block {} ({} bytes)", 
+                            metadata.block_height, metadata.compressed_size);
+                    }
+                    Err(e) => {
+                        error!("❌ Failed to create snapshot: {}", e);
+                    }
+                }
+            }
+        }
+    });
+
     start_rpc_server(tx_queue, config, kv_store_for_rpc.clone(), &server_port).await;
 }
 
@@ -535,39 +572,96 @@ async fn run_fullnode_mode(
         println!("🔗 LibP2P network initialized with peer ID: {}", network.local_peer_id());
         println!("📡 Subscribed to finalized blocks topic");
         
-        // Create block receiver for processing finalized blocks
-        use crate::fullnode::{BlockReceiver, FullnodeApp};
+        // Create enhanced fullnode components for fast sync
+        use crate::fullnode::{
+            BlockReceiver, FullnodeApp, SnapshotManager, SnapshotConfig, 
+            BatchBlockProcessor, BatchConfig, MetricsCollector
+        };
         use hotstuff_rs::types::data_types::BlockHeight;
         
-        let fullnode_app_for_receiver = Arc::new(Mutex::new(FullnodeApp::new(config.clone(), book_executor, initial_version)));
+        // Set up metrics collection
+        let metrics_collector = Arc::new(MetricsCollector::new());
+        
+        // Set up snapshot manager for fast sync
+        let snapshot_config = SnapshotConfig::default();
+        let snapshot_manager = match SnapshotManager::new(snapshot_config, kv_store.clone()) {
+            Ok(manager) => manager,
+            Err(e) => {
+                warn!("⚠️ Failed to initialize snapshot manager: {}, continuing without snapshots", e);
+                SnapshotManager::new(SnapshotConfig::default(), kv_store.clone()).unwrap_or_else(|_| {
+                    panic!("Failed to create snapshot manager even with defaults");
+                })
+            }
+        };
+        
+        // Check for existing snapshots and bootstrap if available
+        if let Ok(Some(latest_snapshot)) = snapshot_manager.get_latest_snapshot() {
+            info!("📸 Found existing snapshot at block {}, attempting bootstrap", latest_snapshot.block_height);
+            if let Err(e) = snapshot_manager.bootstrap_from_snapshot(&latest_snapshot) {
+                warn!("⚠️ Failed to bootstrap from snapshot: {}, proceeding with normal sync", e);
+            } else {
+                info!("🚀 Successfully bootstrapped from snapshot, starting from block {}", latest_snapshot.block_height);
+            }
+        } else {
+            info!("📸 No snapshots found, starting sync from genesis");
+        }
+        
+        let fullnode_app_for_receiver = Arc::new(Mutex::new(FullnodeApp::new(config.clone(), book_executor.clone(), initial_version)));
         let mut block_receiver = BlockReceiver::new(
-            fullnode_app_for_receiver,
+            fullnode_app_for_receiver.clone(),
             Arc::new(kv_store.clone()),
             BlockHeight::new(1), // Start from block 1
             Arc::new(Mutex::new(network.clone())),
         );
+
+        // Set up batch processor for improved throughput
+        let batch_config = BatchConfig::default();
+        let batch_processor = Arc::new(BatchBlockProcessor::new(
+            batch_config,
+            fullnode_app_for_receiver,
+            Arc::new(kv_store.clone()),
+            Some(metrics_collector.clone()),
+        ));
+
+        // Start batch processing loop
+        let processor_for_loop = batch_processor.clone();
+        tokio::spawn(async move {
+            processor_for_loop.start_processing_loop().await;
+        });
         
         // Clone network for message processing
         let mut network_for_events = network.clone();
         
-        // Spawn gossipsub message handler for receiving finalized blocks
+        // Spawn optimized gossipsub message handler with batch processing
+        let batch_processor_for_handler = batch_processor.clone();
+        let metrics_for_handler = metrics_collector.clone();
         tokio::spawn(async move {
-            info!("📡 Starting gossipsub message handler for fullnode");
+            info!("📡 Starting optimized gossipsub message handler for fullnode");
             loop {
                 if let Some(gossip_event) = network_for_events.recv_gossip_event() {
+                    // Record gossip message for metrics
+                    metrics_for_handler.record_gossip_message();
+                    
                     match gossip_event {
                         crate::networking::libp2p_network::GossipEvent::FinalizedBlock(finalized_block_msg) => {
+                            // Update highest known height for metrics
+                            metrics_for_handler.update_highest_known_height(finalized_block_msg.block_height());
+                            
                             // Check for gaps and trigger recovery if needed
                             let received_height = finalized_block_msg.block_height();
                             if received_height > BlockHeight::new(block_receiver.expected_height.int() + 1) {
                                 block_receiver.handle_block_gap(received_height);
                             }
                             
-                            if let Err(e) = block_receiver.process_finalized_block(finalized_block_msg) {
-                                error!("❌ Failed to process finalized block: {}", e);
+                            // Queue block for batch processing instead of immediate processing
+                            if let Err(e) = batch_processor_for_handler.queue_block(finalized_block_msg) {
+                                error!("❌ Failed to queue block for batch processing: {}", e);
                             }
                         }
                         crate::networking::libp2p_network::GossipEvent::BlockResponse(block_response) => {
+                            // Record response time for metrics
+                            metrics_for_handler.record_block_response(Duration::from_millis(100)); // Placeholder timing
+                            
                             if let Err(e) = block_receiver.process_block_response(block_response) {
                                 error!("❌ Failed to process block response: {}", e);
                             }
@@ -594,8 +688,11 @@ async fn run_fullnode_mode(
     println!("📡 Listening for finalized blocks from validators");
     println!("================================================================");
 
-    // Start read-only RPC server for fullnodes  
-    start_fullnode_rpc_server(config, kv_store.clone(), &server_port, None).await;
+    // Create metrics collector for this scope
+    let final_metrics_collector = Arc::new(crate::fullnode::MetricsCollector::new());
+    
+    // Start read-only RPC server for fullnodes with metrics
+    start_fullnode_rpc_server(config, kv_store.clone(), &server_port, Some(final_metrics_collector)).await;
 }
 
 /// Start RPC server for validators (includes transaction submission)

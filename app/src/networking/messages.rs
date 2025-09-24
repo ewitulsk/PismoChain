@@ -142,3 +142,126 @@ impl BlockResponse {
         self.blocks.iter().map(|b| b.size()).sum::<usize>() + 64 // Approximate overhead
     }
 }
+
+/// Request for available snapshots (sent by fullnodes)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotListRequest {
+    /// Request ID for tracking responses
+    pub request_id: u64,
+    /// Minimum block height to consider
+    pub min_height: Option<u64>,
+}
+
+impl SnapshotListRequest {
+    pub fn new(min_height: Option<u64>) -> Self {
+        Self {
+            request_id: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64,
+            min_height,
+        }
+    }
+}
+
+/// Response with available snapshots (sent by validators)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotListResponse {
+    /// Request ID this response corresponds to
+    pub request_id: u64,
+    /// List of available snapshot metadata
+    pub snapshots: Vec<crate::fullnode::SnapshotMetadata>,
+    /// Error message if the request failed
+    pub error: Option<String>,
+}
+
+impl SnapshotListResponse {
+    pub fn success(request_id: u64, snapshots: Vec<crate::fullnode::SnapshotMetadata>) -> Self {
+        Self {
+            request_id,
+            snapshots,
+            error: None,
+        }
+    }
+
+    pub fn error(request_id: u64, error: String) -> Self {
+        Self {
+            request_id,
+            snapshots: Vec::new(),
+            error: Some(error),
+        }
+    }
+}
+
+/// Request for a specific snapshot (sent by fullnodes)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotRequest {
+    /// Block height of the desired snapshot
+    pub block_height: u64,
+    /// Request ID for tracking responses
+    pub request_id: u64,
+}
+
+impl SnapshotRequest {
+    pub fn new(block_height: u64) -> Self {
+        Self {
+            block_height,
+            request_id: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64,
+        }
+    }
+}
+
+/// Response with snapshot data (sent by validators)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotResponse {
+    /// Request ID this response corresponds to
+    pub request_id: u64,
+    /// Snapshot metadata
+    pub metadata: Option<crate::fullnode::SnapshotMetadata>,
+    /// Compressed snapshot data (base64 encoded)
+    pub data: Option<String>,
+    /// Error message if the request failed
+    pub error: Option<String>,
+}
+
+impl SnapshotResponse {
+    pub fn success(
+        request_id: u64, 
+        metadata: crate::fullnode::SnapshotMetadata, 
+        data: Vec<u8>
+    ) -> Self {
+        use base64::Engine;
+        let encoded_data = base64::engine::general_purpose::STANDARD.encode(&data);
+        
+        Self {
+            request_id,
+            metadata: Some(metadata),
+            data: Some(encoded_data),
+            error: None,
+        }
+    }
+
+    pub fn error(request_id: u64, error: String) -> Self {
+        Self {
+            request_id,
+            metadata: None,
+            data: None,
+            error: Some(error),
+        }
+    }
+
+    pub fn decode_data(&self) -> anyhow::Result<Vec<u8>> {
+        use base64::Engine;
+        
+        match &self.data {
+            Some(encoded) => {
+                base64::engine::general_purpose::STANDARD.decode(encoded)
+                    .map_err(|e| anyhow::anyhow!("Failed to decode snapshot data: {}", e))
+            }
+            None => Err(anyhow::anyhow!("No snapshot data in response")),
+        }
+    }
+}
