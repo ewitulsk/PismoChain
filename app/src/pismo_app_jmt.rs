@@ -166,6 +166,22 @@ impl PismoAppJMT {
         }
     }
 
+    /// Safely compute hash for block data, handling empty blocks
+    fn compute_block_data_hash(data: &Data) -> CryptoHash {
+        let mut hasher = CryptoHasher::new();
+        
+        if data.vec().is_empty() {
+            // Hash empty data consistently
+            hasher.update(b"EMPTY_BLOCK");
+        } else {
+            // Hash the first datum as before
+            hasher.update(&data.vec()[0].bytes());
+        }
+        
+        let bytes = hasher.finalize().into();
+        CryptoHash::new(bytes)
+    }
+
     /// Read the latest JMT version from app state
     pub fn read_latest_version<K: KVStore>(block_tree_camera: &hotstuff_rs::block_tree::accessors::public::BlockTreeCamera<K>) -> u64 {
         let snapshot = block_tree_camera.snapshot();
@@ -240,12 +256,7 @@ impl<K: KVStore> App<K> for PismoAppJMT {
             self.next_version = start_version + 1;
             
             let data = Data::new(vec![Datum::new(serialized_payload)]);
-            let data_hash = {
-                let mut hasher = CryptoHasher::new();
-                hasher.update(&data.vec()[0].bytes());
-                let bytes = hasher.finalize().into();
-                CryptoHash::new(bytes)
-            };
+            let data_hash = Self::compute_block_data_hash(&data);
 
             // println!("📦 Empty block produced: version={}, next_version={}, root={:?}", start_version, self.next_version, hex::encode(&previous_root.0[..8]));
 
@@ -275,12 +286,7 @@ impl<K: KVStore> App<K> for PismoAppJMT {
         let serialized_payload = block_payload.try_to_vec().unwrap();
         
         let data = Data::new(vec![Datum::new(serialized_payload)]);
-        let data_hash = {
-            let mut hasher = CryptoHasher::new();
-            hasher.update(&data.vec()[0].bytes());
-            let bytes = hasher.finalize().into();
-            CryptoHash::new(bytes)
-        };
+        let data_hash = Self::compute_block_data_hash(&data);
 
         ProduceBlockResponse {
             data_hash,
@@ -302,18 +308,26 @@ impl<K: KVStore> App<K> for PismoAppJMT {
         request: ValidateBlockRequest<K>,
     ) -> ValidateBlockResponse {
         let data = &request.proposed_block().data;
-        let data_hash: CryptoHash = {
-            let mut hasher = CryptoHasher::new();
-            hasher.update(&data.vec()[0].bytes());
-            let bytes = hasher.finalize().into();
-            CryptoHash::new(bytes)
-        };
+        
+        // Compute data hash (handles empty blocks safely)
+        let data_hash = Self::compute_block_data_hash(data);
 
         if request.proposed_block().data_hash != data_hash {
             return ValidateBlockResponse::Invalid;
         }
 
         let initial_block_tree = request.block_tree();
+
+        // Handle empty blocks during sync - these might be genesis or sync marker blocks
+        if data.vec().is_empty() {
+            println!("🔍 Validating empty sync block with consistent hash");
+            
+            // For empty blocks during sync, validate hash consistency and return valid
+            return ValidateBlockResponse::Valid {
+                app_state_updates: None,
+                validator_set_updates: None,
+            };
+        }
 
         // Deserialize the enhanced block payload
         if let Ok(block_payload) = BlockPayload::deserialize(
@@ -323,8 +337,8 @@ impl<K: KVStore> App<K> for PismoAppJMT {
             let block_final_version = block_payload.final_version;
             let block_start_version = block_payload.start_version;
             
-            println!("🔍 Validating block: start_version={}, final_version={}, tx_count={}", 
-                block_start_version, block_final_version, block_payload.transactions.len());
+            println!("🔍 Validating block: start_version={}, final_version={}, tx_count={}, data_len={}", 
+                block_start_version, block_final_version, block_payload.transactions.len(), data.vec().len());
 
             // Validate all transactions in the block (signature, chain id, nonce)
             for transaction in &block_payload.transactions {
@@ -377,7 +391,8 @@ impl<K: KVStore> App<K> for PismoAppJMT {
                 validator_set_updates: None,
             }
         } else {
-            println!("❌ Block validation failed: Could not deserialize block payload");
+            println!("❌ Block validation failed: Could not deserialize block payload from {} bytes", 
+                data.vec()[0].bytes().len());
             ValidateBlockResponse::Invalid
         }
 
@@ -456,5 +471,45 @@ impl PismoAppJMT {
         let app_state_updates = if has_updates { Some(jmt_updates) } else { None };
         
         (app_state_updates, state_root, new_version)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hotstuff_rs::types::data_types::{Data, Datum};
+    
+    #[test]
+    fn test_compute_block_data_hash_empty() {
+        // Test that empty data produces consistent hash
+        let empty_data = Data::new(vec![]);
+        let hash1 = PismoAppJMT::compute_block_data_hash(&empty_data);
+        let hash2 = PismoAppJMT::compute_block_data_hash(&empty_data);
+        
+        assert_eq!(hash1, hash2, "Empty block hashes should be consistent");
+    }
+    
+    #[test]
+    fn test_compute_block_data_hash_normal() {
+        // Test that normal data produces different hash than empty
+        let normal_data = Data::new(vec![Datum::new(b"test data".to_vec())]);
+        let empty_data = Data::new(vec![]);
+        
+        let normal_hash = PismoAppJMT::compute_block_data_hash(&normal_data);
+        let empty_hash = PismoAppJMT::compute_block_data_hash(&empty_data);
+        
+        assert_ne!(normal_hash, empty_hash, "Normal and empty block hashes should be different");
+    }
+    
+    #[test]
+    fn test_compute_block_data_hash_consistent() {
+        // Test that same data produces same hash
+        let data1 = Data::new(vec![Datum::new(b"identical data".to_vec())]);
+        let data2 = Data::new(vec![Datum::new(b"identical data".to_vec())]);
+        
+        let hash1 = PismoAppJMT::compute_block_data_hash(&data1);
+        let hash2 = PismoAppJMT::compute_block_data_hash(&data2);
+        
+        assert_eq!(hash1, hash2, "Identical data should produce identical hashes");
     }
 }

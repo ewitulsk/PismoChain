@@ -34,7 +34,9 @@ use crate::networking::{
     composite_behaviour::HotstuffNetworkBehaviour,
     stream_behaviour::StreamEvent,
     config::NetworkRuntimeConfig,
+    messages::FinalizedBlockMessage,
 };
+use crate::types::NodeMode;
 
 /// Commands sent to the network task
 pub enum NetworkCommand {
@@ -51,6 +53,10 @@ pub enum NetworkCommand {
     UpdateValidatorSet {
         updates: ValidatorSetUpdates,
     },
+    /// Publish a finalized block (validators only)
+    PublishFinalizedBlock {
+        message: FinalizedBlockMessage,
+    },
     /// Shutdown the network
     Shutdown,
 }
@@ -59,6 +65,11 @@ pub enum NetworkCommand {
 pub struct NetworkEvent {
     pub peer: VerifyingKey,
     pub message: Message,
+}
+
+/// Gossipsub events for fullnode block reception
+pub enum GossipEvent {
+    FinalizedBlock(FinalizedBlockMessage),
 }
 
 /// Shutdown guard that handles network cleanup when the last reference is dropped
@@ -89,6 +100,8 @@ pub struct LibP2PNetwork {
     command_sender: UnboundedSender<NetworkCommand>,
     /// Channel to receive messages from the network task
     message_receiver: Arc<Mutex<UnboundedReceiver<NetworkEvent>>>,
+    /// Channel to receive gossipsub events (for fullnodes)
+    gossip_receiver: Arc<Mutex<UnboundedReceiver<GossipEvent>>>,
     /// Channel to send loopback messages directly to self
     loopback_sender: UnboundedSender<NetworkEvent>,
     /// Runtime configuration
@@ -107,6 +120,7 @@ impl LibP2PNetwork {
         keypair: Keypair,
         config: NetworkRuntimeConfig,
         my_verifying_key: VerifyingKey,
+        node_mode: NodeMode,
     ) -> Result<Self> {
         let local_peer_id = PeerId::from(keypair.public());
         //info!("Starting LibP2P network with peer ID: {}", local_peer_id);
@@ -116,6 +130,10 @@ impl LibP2PNetwork {
         let (event_sender, message_receiver) = mpsc::unbounded_channel();
         let message_receiver = Arc::new(Mutex::new(message_receiver));
         
+        // Create gossipsub channel for fullnode block messages
+        let (gossip_sender, gossip_receiver) = mpsc::unbounded_channel();
+        let gossip_receiver = Arc::new(Mutex::new(gossip_receiver));
+        
         // Create loopback channel for self-messages
         let (loopback_sender, loopback_receiver) = mpsc::unbounded_channel();
 
@@ -123,7 +141,7 @@ impl LibP2PNetwork {
         let transport = Self::build_transport(&keypair)?;
 
         // Create the composite behaviour
-        let behaviour = HotstuffNetworkBehaviour::new(local_peer_id, keypair.public(), config.clone());
+        let behaviour = HotstuffNetworkBehaviour::new(local_peer_id, keypair.clone(), config.clone(), node_mode)?;
 
         // Create the swarm using the new API
         let mut swarm = SwarmBuilder::with_existing_identity(keypair.clone())
@@ -163,6 +181,7 @@ impl LibP2PNetwork {
                 swarm,
                 command_receiver,
                 event_sender,
+                gossip_sender,
                 loopback_receiver,
                 config_for_task,
             ).await;
@@ -178,6 +197,7 @@ impl LibP2PNetwork {
         Ok(Self {
             command_sender,
             message_receiver,
+            gossip_receiver,
             loopback_sender,
             config,
             local_peer_id,
@@ -218,6 +238,7 @@ impl LibP2PNetwork {
         mut swarm: Swarm<HotstuffNetworkBehaviour>,
         mut command_receiver: UnboundedReceiver<NetworkCommand>,
         event_sender: UnboundedSender<NetworkEvent>,
+        gossip_sender: UnboundedSender<GossipEvent>,
         mut loopback_receiver: UnboundedReceiver<NetworkEvent>,
         config: NetworkRuntimeConfig,
     ) {
@@ -250,6 +271,12 @@ impl LibP2PNetwork {
                             match event_result {
                         SwarmEvent::Behaviour(composite_event) => {
                             //info!("Handling behaviour event: {:?}", std::mem::discriminant(&composite_event));
+                            // Handle gossipsub events directly
+                            if let crate::networking::composite_behaviour::CompositeEvent::Gossipsub(gossip_event) = &composite_event {
+                                Self::handle_gossipsub_event(gossip_event, &gossip_sender).await;
+                            }
+                            
+                            // Handle other events via stream conversion
                             if let Some(stream_event) = composite_event.into_stream_event(&config) {
                                 Self::handle_behaviour_event(stream_event, &event_sender, &config).await;
                             }
@@ -344,6 +371,11 @@ impl LibP2PNetwork {
                             debug!("Validator set update received (not implemented)");
                             Ok(false) // Continue loop
                         }
+                        Some(NetworkCommand::PublishFinalizedBlock { message }) => {
+                            debug!("Network task: Processing PublishFinalizedBlock command");
+                            Self::handle_publish_finalized_block(&mut swarm, message).await;
+                            Ok(false) // Continue loop
+                        }
                         Some(NetworkCommand::Shutdown) => {
                             //info!("Network shutdown requested");
                             Ok(true) // Exit loop
@@ -406,6 +438,49 @@ impl LibP2PNetwork {
         }
 
         //info!("Network task shutting down");
+    }
+
+    /// Handle gossipsub events
+    async fn handle_gossipsub_event(
+        event: &libp2p::gossipsub::Event,
+        gossip_sender: &UnboundedSender<GossipEvent>,
+    ) {
+        use libp2p::gossipsub::Event;
+        
+        match event {
+            Event::Message {
+                propagation_source: _,
+                message_id: _,
+                message,
+            } => {
+                // Try to deserialize as FinalizedBlockMessage
+                match serde_json::from_slice::<FinalizedBlockMessage>(&message.data) {
+                    Ok(finalized_block_msg) => {
+                        info!("📨 Received finalized block message (height: {})", finalized_block_msg.block_height);
+                        
+                        // Forward to gossip event channel for fullnode processing
+                        let gossip_event = GossipEvent::FinalizedBlock(finalized_block_msg);
+                        if let Err(e) = gossip_sender.send(gossip_event) {
+                            error!("Failed to forward gossipsub message: {}", e);
+                        } else {
+                            info!("✅ Forwarded finalized block to gossip event channel");
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to deserialize gossipsub message as finalized block: {}", e);
+                    }
+                }
+            }
+            Event::Subscribed { peer_id, topic } => {
+                info!("📡 Peer {} subscribed to topic {}", peer_id, topic);
+            }
+            Event::Unsubscribed { peer_id, topic } => {
+                info!("📡 Peer {} unsubscribed from topic {}", peer_id, topic);
+            }
+            Event::GossipsubNotSupported { peer_id } => {
+                warn!("Peer {} does not support gossipsub", peer_id);
+            }
+        }
     }
 
     /// Handle behaviour events from the swarm
@@ -497,6 +572,21 @@ impl LibP2PNetwork {
         }
     }
 
+    /// Handle publish finalized block command
+    async fn handle_publish_finalized_block(
+        swarm: &mut Swarm<HotstuffNetworkBehaviour>,
+        message: FinalizedBlockMessage,
+    ) {
+        match swarm.behaviour_mut().publish_finalized_block(message) {
+            Ok(_) => {
+                debug!("Finalized block published successfully");
+            }
+            Err(e) => {
+                error!("Failed to publish finalized block: {}", e);
+            }
+        }
+    }
+
     /// Handle reconnection attempts for disconnected peers
     async fn handle_reconnection_attempts(
         swarm: &mut Swarm<HotstuffNetworkBehaviour>,
@@ -525,6 +615,21 @@ impl LibP2PNetwork {
         self.local_peer_id
     }
 
+    /// Receive gossipsub events (for fullnodes)
+    pub fn recv_gossip_event(&mut self) -> Option<GossipEvent> {
+        if let Ok(mut receiver) = self.gossip_receiver.try_lock() {
+            match receiver.try_recv() {
+                Ok(event) => Some(event),
+                Err(mpsc::error::TryRecvError::Empty) => None,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    error!("Gossip event channel disconnected");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    }
 
     /// Get connection statistics
     pub fn connection_stats(&self) -> HashMap<String, usize> {
@@ -539,6 +644,7 @@ impl Clone for LibP2PNetwork {
         Self {
             command_sender: self.command_sender.clone(),
             message_receiver: self.message_receiver.clone(),
+            gossip_receiver: self.gossip_receiver.clone(),
             loopback_sender: self.loopback_sender.clone(),
             config: self.config.clone(),
             local_peer_id: self.local_peer_id,
@@ -646,6 +752,16 @@ impl Network for LibP2PNetwork {
             None
         }
     }
+
+}
+
+impl LibP2PNetwork {
+    /// Publish a finalized block to the gossipsub network (validators only)
+    pub fn publish_finalized_block(&self, message: FinalizedBlockMessage) -> Result<(), String> {
+        let command = NetworkCommand::PublishFinalizedBlock { message };
+        self.command_sender.send(command)
+            .map_err(|e| format!("Failed to send publish finalized block command: {}", e))
+    }
 }
 
 // Drop implementation removed - shutdown is now handled by ShutdownGuard
@@ -691,7 +807,7 @@ mod tests {
             NetworkConfig::default()
         ).unwrap();
 
-        let result = LibP2PNetwork::new(keypair, config, verifying_key).await;
+        let result = LibP2PNetwork::new(keypair, config, verifying_key, crate::types::NodeMode::Validator).await;
         assert!(result.is_ok());
 
         let network = result.unwrap();

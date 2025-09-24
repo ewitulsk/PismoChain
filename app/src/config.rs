@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::env;
+use crate::types::NodeMode;
 
 /// Main configuration structure for the PismoChain CounterApp
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8,6 +9,8 @@ pub struct Config {
     pub chain_id: u16,
     pub network: String,
     pub sui: Sui,
+    #[serde(default)]
+    pub node_mode: NodeMode,
 }
 
 /// Sui-specific configuration settings

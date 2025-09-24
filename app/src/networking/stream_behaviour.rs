@@ -18,7 +18,7 @@ use crate::networking::{
     config::NetworkRuntimeConfig,
     stream_handler::{HotstuffStreamHandler, HandlerInEvent, HandlerOutEvent},
 };
-use tracing::{debug, warn, info};
+use tracing::{debug, warn};
 
 /// Events emitted by the StreamBehaviour
 pub enum StreamEvent {
@@ -73,6 +73,10 @@ pub struct StreamBehaviour {
     pending_events: VecDeque<StreamEvent>,
     /// Keep-alive timer
     last_keepalive: Instant,
+    /// Track messages sent this poll cycle to implement fairness
+    messages_sent_this_poll: usize,
+    /// Maximum messages to send per poll cycle
+    max_messages_per_poll: usize,
 }
 
 impl StreamBehaviour {
@@ -101,11 +105,13 @@ impl StreamBehaviour {
         }
 
         Self {
+            max_messages_per_poll: config.messages_per_poll_batch,
             config,
             connections,
             message_queue: HashMap::new(),
             pending_events: VecDeque::new(),
             last_keepalive: now,
+            messages_sent_this_poll: 0,
         }
     }
 
@@ -239,6 +245,49 @@ impl StreamBehaviour {
             }
         }
     }
+
+    /// Process up to `batch_size` messages for a peer
+    /// Returns (messages_processed, should_continue)
+    fn process_message_batch(
+        &mut self,
+        peer_id: PeerId,
+        batch_size: usize,
+    ) -> (Vec<HandlerInEvent>, bool) {
+        let mut events = Vec::new();
+        let mut processed = 0;
+        
+        if let Some(queue) = self.message_queue.get_mut(&peer_id) {
+            while processed < batch_size && !queue.is_empty() {
+                if let Some(message) = queue.pop_front() {
+                    events.push(HandlerInEvent::SendMessage(message));
+                    processed += 1;
+                }
+            }
+        }
+        
+        let has_more = self.message_queue.get(&peer_id)
+            .map(|q| !q.is_empty())
+            .unwrap_or(false);
+            
+        (events, has_more)
+    }
+
+    /// Check if any connected peer has pending messages
+    fn has_pending_messages(&self) -> bool {
+        self.connections.iter().any(|(peer_id, state)| {
+            state.connected && 
+            self.message_queue.get(peer_id)
+                .map(|q| !q.is_empty())
+                .unwrap_or(false)
+        })
+    }
+    
+    /// Get total number of queued messages across all peers
+    pub fn total_queued_messages(&self) -> usize {
+        self.message_queue.values()
+            .map(|q| q.len())
+            .sum()
+    }
 }
 
 impl NetworkBehaviour for StreamBehaviour {
@@ -317,41 +366,97 @@ impl NetworkBehaviour for StreamBehaviour {
 
     fn poll(
         &mut self,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
     ) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
-        // First, check if we have any pending events
+        // Reset cycle counter if we've completed a full cycle
+        if self.messages_sent_this_poll >= self.max_messages_per_poll {
+            self.messages_sent_this_poll = 0;
+        }
+        
+        // First, handle pending events
         if let Some(event) = self.pending_events.pop_front() {
-            // Handle special case for connection established - send queued messages
+            // Special handling for ConnectionEstablished
             if let StreamEvent::ConnectionEstablished { peer_id } = &event {
-                if let Some(mut queue) = self.message_queue.remove(peer_id) {
-                    while let Some(message) = queue.pop_front() {
-                        return Poll::Ready(ToSwarm::NotifyHandler {
-                            peer_id: *peer_id,
-                            handler: libp2p::swarm::NotifyHandler::Any,
-                            event: HandlerInEvent::SendMessage(message),
-                        });
+                let remaining_budget = self.max_messages_per_poll - self.messages_sent_this_poll;
+                let batch_size = remaining_budget.min(10); // Max 10 per peer per batch
+                
+                let (mut events, _) = self.process_message_batch(*peer_id, batch_size);
+                if !events.is_empty() {
+                    self.messages_sent_this_poll += 1; // Count only the one we're returning
+                    // Put remaining events back at the front for next poll
+                    if events.len() > 1 {
+                        for remaining_event in events.drain(1..).rev() {
+                            let HandlerInEvent::SendMessage(msg) = remaining_event;
+                            if let Some(queue) = self.message_queue.get_mut(peer_id) {
+                                queue.push_front(msg);
+                            }
+                        }
                     }
+                    return Poll::Ready(ToSwarm::NotifyHandler {
+                        peer_id: *peer_id,
+                        handler: libp2p::swarm::NotifyHandler::Any,
+                        event: events.into_iter().next().unwrap(),
+                    });
                 }
             }
-            
             return Poll::Ready(ToSwarm::GenerateEvent(event));
         }
         
-        // Check for messages to send from queues (for newly connected peers)
-        for (peer_id, conn_state) in &self.connections {
-            if conn_state.connected {
-                if let Some(queue) = self.message_queue.get_mut(peer_id) {
-                    if let Some(message) = queue.pop_front() {
+        // Process messages for connected peers (round-robin for fairness)
+        let remaining_budget = self.max_messages_per_poll - self.messages_sent_this_poll;
+        if remaining_budget > 0 {
+            // Collect connected peers with messages
+            let peers_with_messages: Vec<_> = self.connections
+                .iter()
+                .filter(|(peer_id, state)| {
+                    state.connected && 
+                    self.message_queue.get(peer_id)
+                        .map(|q| !q.is_empty())
+                        .unwrap_or(false)
+                })
+                .map(|(peer_id, _)| *peer_id)
+                .collect();
+            
+            // Round-robin: process a few messages from each peer
+            if !peers_with_messages.is_empty() {
+                let messages_per_peer = (remaining_budget / peers_with_messages.len()).max(1);
+                
+                for peer_id in peers_with_messages {
+                    let (mut events, _) = self.process_message_batch(peer_id, messages_per_peer);
+                    if !events.is_empty() {
+                        self.messages_sent_this_poll += 1;
+                        // Put remaining events back at the front for next poll
+                        if events.len() > 1 {
+                            for remaining_event in events.drain(1..).rev() {
+                                let HandlerInEvent::SendMessage(msg) = remaining_event;
+                                if let Some(queue) = self.message_queue.get_mut(&peer_id) {
+                                    queue.push_front(msg);
+                                }
+                            }
+                        }
                         return Poll::Ready(ToSwarm::NotifyHandler {
-                            peer_id: *peer_id,
+                            peer_id,
                             handler: libp2p::swarm::NotifyHandler::Any,
-                            event: HandlerInEvent::SendMessage(message),
+                            event: events.into_iter().next().unwrap(),
                         });
                     }
                 }
             }
         }
         
+        // Wake the task if we still have messages to process
+        if self.has_pending_messages() && self.messages_sent_this_poll < self.max_messages_per_poll {
+            cx.waker().wake_by_ref();
+        }
+        
+        // Add periodic logging for high queue depth
+        if self.total_queued_messages() > 100 {
+            debug!(
+                "High message queue depth: {} messages across {} peers",
+                self.total_queued_messages(),
+                self.message_queue.len()
+            );
+        }
         
         Poll::Pending
     }

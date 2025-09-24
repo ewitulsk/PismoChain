@@ -35,6 +35,8 @@ pub struct NetworkConfig {
     pub substream_timeout: Option<u64>,
     /// Protocol handshake timeout in seconds
     pub handshake_timeout: Option<u64>,
+    /// Maximum messages to process per poll cycle per peer
+    pub messages_per_poll_batch: Option<usize>,
 }
 
 impl Default for NetworkConfig {
@@ -49,6 +51,7 @@ impl Default for NetworkConfig {
             retry_backoff_base_ms: Some(500),
             substream_timeout: Some(10),
             handshake_timeout: Some(15),
+            messages_per_poll_batch: Some(50),
         }
     }
 }
@@ -78,6 +81,8 @@ pub struct NetworkRuntimeConfig {
     pub substream_timeout: Duration,
     /// Protocol handshake timeout
     pub handshake_timeout: Duration,
+    /// Maximum messages to process per poll cycle
+    pub messages_per_poll_batch: usize,
 }
 
 impl NetworkRuntimeConfig {
@@ -131,6 +136,7 @@ impl NetworkRuntimeConfig {
             retry_backoff_base: Duration::from_millis(config.retry_backoff_base_ms.unwrap_or(500)),
             substream_timeout: Duration::from_secs(config.substream_timeout.unwrap_or(10)),
             handshake_timeout: Duration::from_secs(config.handshake_timeout.unwrap_or(15)),
+            messages_per_poll_batch: config.messages_per_poll_batch.unwrap_or(50),
         })
     }
 
