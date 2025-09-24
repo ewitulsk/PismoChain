@@ -151,7 +151,7 @@ async fn main() {
     }
     
     // Load configuration from CONFIG_PATH environment variable or default path
-    let config = match load_config() {
+    let mut config = match load_config() {
         Ok(config) => config,
         Err(e) => {
             eprintln!("❌ Configuration error: {}", e);
@@ -159,6 +159,21 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    
+    // Override node mode from environment variable if specified
+    if let Ok(node_mode_str) = std::env::var("PISMO_NODE_MODE") {
+        match node_mode_str.parse::<NodeMode>() {
+            Ok(mode) => {
+                config.node_mode = mode;
+                println!("🔧 Node mode overridden from environment: {}", mode);
+            }
+            Err(e) => {
+                eprintln!("❌ Invalid PISMO_NODE_MODE value '{}': {}", node_mode_str, e);
+                eprintln!("💡 Use 'validator' or 'fullnode'");
+                std::process::exit(1);
+            }
+        }
+    }
     
     // Log node mode information
     match config.node_mode {
@@ -227,12 +242,13 @@ async fn main() {
         }
     };
 
-    // Validate that validators are in the network config, but allow fullnodes to not be
+    // Validate node configuration based on mode
     let my_hex_key = hex::encode(verifying_key.to_bytes());
     let is_in_config = network_config.validators.iter().any(|v| v.verifying_key == my_hex_key);
 
     match config.node_mode {
         NodeMode::Validator => {
+            // Validators MUST be in the network configuration
             if !is_in_config {
                 eprintln!("❌ ERROR: This validator is not in the network configuration!");
                 eprintln!("   My key: {}", my_hex_key);
@@ -246,13 +262,16 @@ async fn main() {
                 eprintln!("   - Use a validator key that's already in the config");
                 eprintln!("   - Set VALIDATOR_KEYS_PATH to point to a configured validator's keys");
                 std::process::exit(1);
+            } else {
+                println!("✅ Validator key found in network configuration");
             }
         }
         NodeMode::Fullnode => {
+            // Fullnodes should NOT be in the validator set (this is expected and correct)
             if is_in_config {
                 println!("⚠️  Warning: Fullnode key is in validator set but will not participate in consensus");
             } else {
-                println!("✅ Fullnode key is not in validator set (expected)");
+                println!("✅ Fullnode key is not in validator set (expected for fullnodes)");
             }
         }
     }
