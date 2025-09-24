@@ -5,25 +5,32 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 use hotstuff_rs::{
     types::{data_types::BlockHeight, block::Block},
 };
-use tracing::{info, warn, debug};
+use tracing::{info, warn, debug, error};
 
 use crate::{
-    networking::FinalizedBlockMessage,
-    fullnode::FullnodeApp,
-    database::rocks_db::RocksDBStore,
+    database::rocks_db::RocksDBStore, fullnode::FullnodeApp, networking::{BlockRequest, BlockResponse, FinalizedBlockMessage, LibP2PNetwork}
 };
 
 /// Receives and processes finalized blocks for fullnodes
 pub struct BlockReceiver {
     fullnode_app: Arc<Mutex<FullnodeApp>>,
     kv_store: Arc<RocksDBStore>,
-    expected_height: BlockHeight,
+    pub expected_height: BlockHeight,
     pending_blocks: HashMap<u64, FinalizedBlockMessage>,
     max_pending_blocks: usize,
+    /// Network handle for requesting missing blocks
+    network: Arc<Mutex<LibP2PNetwork>>,
+    /// Track when we last requested blocks to avoid spam
+    last_request_time: Instant,
+    /// Minimum time between block requests
+    request_cooldown: Duration,
+    /// Track pending block requests
+    pending_requests: HashMap<u64, Instant>, // request_id -> timestamp
 }
 
 impl BlockReceiver {
@@ -32,6 +39,7 @@ impl BlockReceiver {
         fullnode_app: Arc<Mutex<FullnodeApp>>,
         kv_store: Arc<RocksDBStore>,
         initial_height: BlockHeight,
+        network: Arc<Mutex<LibP2PNetwork>>,
     ) -> Self {
         Self {
             fullnode_app,
@@ -39,6 +47,10 @@ impl BlockReceiver {
             expected_height: initial_height,
             pending_blocks: HashMap::new(),
             max_pending_blocks: 100, // Limit memory usage
+            network,
+            last_request_time: Instant::now() - Duration::from_secs(60), // Allow immediate first request
+            request_cooldown: Duration::from_secs(5), // Wait 5 seconds between requests
+            pending_requests: HashMap::new(),
         }
     }
 
@@ -130,9 +142,74 @@ impl BlockReceiver {
             warn!("🔍 Block gap detected: expected {}, received {}", 
                 self.expected_height, detected_height);
             
-            // In a full implementation, this would trigger block sync
-            // to request the missing blocks from validators
+            // Request missing blocks if cooldown has passed
+            self.request_missing_blocks(detected_height);
         }
+    }
+
+    /// Request missing blocks from validators
+    fn request_missing_blocks(&mut self, up_to_height: BlockHeight) {
+        let now = Instant::now();
+        
+        // Check cooldown to avoid spamming requests
+        if now.duration_since(self.last_request_time) < self.request_cooldown {
+            debug!("Block request still in cooldown, skipping");
+            return;
+        }
+
+        // Clean up expired requests (older than 30 seconds)
+        let request_timeout = Duration::from_secs(30);
+        self.pending_requests.retain(|_, timestamp| {
+            now.duration_since(*timestamp) < request_timeout
+        });
+
+        // Request blocks in batches of 10
+        let start_height = self.expected_height.int();
+        let end_height = up_to_height.int().min(start_height + 9); // Request up to 10 blocks
+        
+        let request = BlockRequest::block_range(start_height, end_height);
+        let request_id = request.request_id;
+        
+        // Send the request via network
+        if let Ok(network) = self.network.lock() {
+            match network.request_blocks(request) {
+                Ok(_) => {
+                    self.last_request_time = now;
+                    self.pending_requests.insert(request_id, now);
+                    info!("📤 Requested blocks {} to {} (request_id: {})", start_height, end_height, request_id);
+                }
+                Err(e) => {
+                    error!("❌ Failed to request blocks: {}", e);
+                }
+            }
+        } else {
+            error!("❌ Failed to acquire network lock for block request");
+        }
+    }
+
+    /// Process a block response from validators
+    pub fn process_block_response(&mut self, response: BlockResponse) -> anyhow::Result<()> {
+        // Check if this is a response to one of our requests
+        if self.pending_requests.remove(&response.request_id).is_none() {
+            debug!("Received response for unknown request_id: {}", response.request_id);
+            return Ok(());
+        }
+
+        if let Some(error) = &response.error {
+            warn!("❌ Block request failed: {}", error);
+            return Ok(());
+        }
+
+        info!("📦 Processing block response with {} blocks", response.blocks.len());
+
+        // Process each block in the response
+        for finalized_block in response.blocks {
+            if let Err(e) = self.process_finalized_block(finalized_block) {
+                error!("❌ Failed to process block from response: {}", e);
+            }
+        }
+
+        Ok(())
     }
 }
 

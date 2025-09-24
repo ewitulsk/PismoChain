@@ -11,4 +11,4 @@ pub mod composite_behaviour;
 pub use mock_network::MockNetwork;
 pub use libp2p_network::{LibP2PNetwork, create_libp2p_keypair_from_validator};
 pub use config::{NetworkConfig, NetworkRuntimeConfig, load_network_config};
-pub use messages::FinalizedBlockMessage;
+pub use messages::{FinalizedBlockMessage, BlockRequest, BlockResponse};

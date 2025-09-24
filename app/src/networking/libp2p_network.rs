@@ -31,10 +31,7 @@ use hotstuff_rs::{
 };
 
 use crate::networking::{
-    composite_behaviour::HotstuffNetworkBehaviour,
-    stream_behaviour::StreamEvent,
-    config::NetworkRuntimeConfig,
-    messages::FinalizedBlockMessage,
+    composite_behaviour::{GossipTopics, HotstuffNetworkBehaviour}, config::NetworkRuntimeConfig, messages::FinalizedBlockMessage, stream_behaviour::StreamEvent, BlockRequest, BlockResponse
 };
 use crate::types::NodeMode;
 
@@ -57,6 +54,14 @@ pub enum NetworkCommand {
     PublishFinalizedBlock {
         message: FinalizedBlockMessage,
     },
+    /// Publish a block request (fullnodes only)
+    PublishBlockRequest {
+        request: BlockRequest,
+    },
+    /// Publish a block response (validators only)
+    PublishBlockResponse {
+        response: BlockResponse,
+    },
     /// Shutdown the network
     Shutdown,
 }
@@ -70,6 +75,8 @@ pub struct NetworkEvent {
 /// Gossipsub events for fullnode block reception
 pub enum GossipEvent {
     FinalizedBlock(FinalizedBlockMessage),
+    BlockRequest(crate::networking::messages::BlockRequest),
+    BlockResponse(crate::networking::messages::BlockResponse),
 }
 
 /// Shutdown guard that handles network cleanup when the last reference is dropped
@@ -376,6 +383,16 @@ impl LibP2PNetwork {
                             Self::handle_publish_finalized_block(&mut swarm, message).await;
                             Ok(false) // Continue loop
                         }
+                        Some(NetworkCommand::PublishBlockRequest { request }) => {
+                            debug!("Network task: Processing PublishBlockRequest command");
+                            Self::handle_publish_block_request(&mut swarm, request).await;
+                            Ok(false) // Continue loop
+                        }
+                        Some(NetworkCommand::PublishBlockResponse { response }) => {
+                            debug!("Network task: Processing PublishBlockResponse command");
+                            Self::handle_publish_block_response(&mut swarm, response).await;
+                            Ok(false) // Continue loop
+                        }
                         Some(NetworkCommand::Shutdown) => {
                             //info!("Network shutdown requested");
                             Ok(true) // Exit loop
@@ -453,22 +470,56 @@ impl LibP2PNetwork {
                 message_id: _,
                 message,
             } => {
-                // Try to deserialize as FinalizedBlockMessage
-                match serde_json::from_slice::<FinalizedBlockMessage>(&message.data) {
-                    Ok(finalized_block_msg) => {
-                        info!("📨 Received finalized block message (height: {})", finalized_block_msg.block_height);
-                        
-                        // Forward to gossip event channel for fullnode processing
-                        let gossip_event = GossipEvent::FinalizedBlock(finalized_block_msg);
-                        if let Err(e) = gossip_sender.send(gossip_event) {
-                            error!("Failed to forward gossipsub message: {}", e);
-                        } else {
-                            info!("✅ Forwarded finalized block to gossip event channel");
+                // Determine message type based on topic
+                let topic_hash = &message.topic;
+                
+                if topic_hash == &GossipTopics::finalized_blocks_topic().hash() {
+                    // Try to deserialize as FinalizedBlockMessage
+                    match serde_json::from_slice::<FinalizedBlockMessage>(&message.data) {
+                        Ok(finalized_block_msg) => {
+                            info!("📨 Received finalized block message (height: {})", finalized_block_msg.block_height);
+                            
+                            let gossip_event = GossipEvent::FinalizedBlock(finalized_block_msg);
+                            if let Err(e) = gossip_sender.send(gossip_event) {
+                                error!("Failed to forward finalized block message: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to deserialize finalized block message: {}", e);
                         }
                     }
-                    Err(e) => {
-                        warn!("Failed to deserialize gossipsub message as finalized block: {}", e);
+                } else if topic_hash == &GossipTopics::block_requests_topic().hash() {
+                    // Try to deserialize as BlockRequest
+                    match serde_json::from_slice::<crate::networking::messages::BlockRequest>(&message.data) {
+                        Ok(block_request) => {
+                            info!("📨 Received block request (start: {}, end: {})", block_request.start_height, block_request.end_height);
+                            
+                            let gossip_event = GossipEvent::BlockRequest(block_request);
+                            if let Err(e) = gossip_sender.send(gossip_event) {
+                                error!("Failed to forward block request: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to deserialize block request: {}", e);
+                        }
                     }
+                } else if topic_hash == &GossipTopics::block_responses_topic().hash() {
+                    // Try to deserialize as BlockResponse
+                    match serde_json::from_slice::<crate::networking::messages::BlockResponse>(&message.data) {
+                        Ok(block_response) => {
+                            info!("📨 Received block response (request_id: {}, {} blocks)", block_response.request_id, block_response.blocks.len());
+                            
+                            let gossip_event = GossipEvent::BlockResponse(block_response);
+                            if let Err(e) = gossip_sender.send(gossip_event) {
+                                error!("Failed to forward block response: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to deserialize block response: {}", e);
+                        }
+                    }
+                } else {
+                    warn!("Received gossipsub message on unknown topic: {}", topic_hash);
                 }
             }
             Event::Subscribed { peer_id, topic } => {
@@ -583,6 +634,36 @@ impl LibP2PNetwork {
             }
             Err(e) => {
                 error!("Failed to publish finalized block: {}", e);
+            }
+        }
+    }
+
+    /// Handle publish block request command
+    async fn handle_publish_block_request(
+        swarm: &mut Swarm<HotstuffNetworkBehaviour>,
+        request: crate::networking::messages::BlockRequest,
+    ) {
+        match swarm.behaviour_mut().publish_block_request(request) {
+            Ok(_) => {
+                debug!("Block request published successfully");
+            }
+            Err(e) => {
+                error!("Failed to publish block request: {}", e);
+            }
+        }
+    }
+
+    /// Handle publish block response command
+    async fn handle_publish_block_response(
+        swarm: &mut Swarm<HotstuffNetworkBehaviour>,
+        response: crate::networking::messages::BlockResponse,
+    ) {
+        match swarm.behaviour_mut().publish_block_response(response) {
+            Ok(_) => {
+                debug!("Block response published successfully");
+            }
+            Err(e) => {
+                error!("Failed to publish block response: {}", e);
             }
         }
     }
@@ -761,6 +842,22 @@ impl LibP2PNetwork {
         let command = NetworkCommand::PublishFinalizedBlock { message };
         self.command_sender.send(command)
             .map_err(|e| format!("Failed to send publish finalized block command: {}", e))
+    }
+
+    /// Request blocks from validators (fullnodes only)
+    pub fn request_blocks(&self, request: crate::networking::messages::BlockRequest) -> Result<(), String> {
+        // For now, we'll create a simple command to publish the request
+        // In a full implementation, you might want to track pending requests
+        let command = NetworkCommand::PublishBlockRequest { request };
+        self.command_sender.send(command)
+            .map_err(|e| format!("Failed to send block request command: {}", e))
+    }
+
+    /// Respond to block requests (validators only)
+    pub fn respond_to_block_request(&self, response: crate::networking::messages::BlockResponse) -> Result<(), String> {
+        let command = NetworkCommand::PublishBlockResponse { response };
+        self.command_sender.send(command)
+            .map_err(|e| format!("Failed to send block response command: {}", e))
     }
 }
 

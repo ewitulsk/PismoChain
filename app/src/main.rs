@@ -43,7 +43,7 @@ use jsonrpsee::server::ServerBuilder;
 use jsonrpsee::RpcModule;
  
 use tokio::signal;
-use tracing::{info, error};
+use tracing::{info, error, debug};
 
 use crate::{
     database::rocks_db::RocksDBStore,
@@ -416,6 +416,39 @@ async fn run_validator_mode(
         println!("🔗 LibP2P network initialized with peer ID: {}", network.local_peer_id());
         println!("🔐 Using same Ed25519 key material for both consensus and networking");
         
+        // Set up block request handler for validators
+        use crate::fullnode::BlockRequestHandler;
+        let mut block_request_handler = BlockRequestHandler::new(
+            Arc::new(Mutex::new(network.clone())),
+            kv_store.clone()
+        );
+        
+        // Clone network for request processing
+        let mut network_for_requests = network.clone();
+        
+        // Spawn block request handler for validators
+        tokio::spawn(async move {
+            info!("📡 Starting block request handler for validator");
+            loop {
+                if let Some(gossip_event) = network_for_requests.recv_gossip_event() {
+                    match gossip_event {
+                        crate::networking::libp2p_network::GossipEvent::BlockRequest(block_request) => {
+                            if let Err(e) = block_request_handler.process_block_request(block_request) {
+                                error!("❌ Failed to process block request: {}", e);
+                            }
+                        }
+                        _ => {
+                            // Validators don't process finalized blocks or responses from gossipsub
+                            debug!("Validator received non-request gossip event (ignoring)");
+                        }
+                    }
+                } else {
+                    // No messages, sleep briefly to avoid busy waiting
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        });
+        
         ReplicaSpec::builder()
             .app(pismo_app)
             .network(network)
@@ -511,6 +544,7 @@ async fn run_fullnode_mode(
             fullnode_app_for_receiver,
             Arc::new(kv_store.clone()),
             BlockHeight::new(1), // Start from block 1
+            Arc::new(Mutex::new(network.clone())),
         );
         
         // Clone network for message processing
@@ -523,9 +557,24 @@ async fn run_fullnode_mode(
                 if let Some(gossip_event) = network_for_events.recv_gossip_event() {
                     match gossip_event {
                         crate::networking::libp2p_network::GossipEvent::FinalizedBlock(finalized_block_msg) => {
+                            // Check for gaps and trigger recovery if needed
+                            let received_height = finalized_block_msg.block_height();
+                            if received_height > BlockHeight::new(block_receiver.expected_height.int() + 1) {
+                                block_receiver.handle_block_gap(received_height);
+                            }
+                            
                             if let Err(e) = block_receiver.process_finalized_block(finalized_block_msg) {
                                 error!("❌ Failed to process finalized block: {}", e);
                             }
+                        }
+                        crate::networking::libp2p_network::GossipEvent::BlockResponse(block_response) => {
+                            if let Err(e) = block_receiver.process_block_response(block_response) {
+                                error!("❌ Failed to process block response: {}", e);
+                            }
+                        }
+                        crate::networking::libp2p_network::GossipEvent::BlockRequest(_) => {
+                            // Fullnodes don't handle block requests - only validators do
+                            debug!("Received block request (ignoring in fullnode mode)");
                         }
                     }
                 } else {
@@ -545,8 +594,8 @@ async fn run_fullnode_mode(
     println!("📡 Listening for finalized blocks from validators");
     println!("================================================================");
 
-    // Start read-only RPC server for fullnodes
-    start_fullnode_rpc_server(config, kv_store.clone(), &server_port).await;
+    // Start read-only RPC server for fullnodes  
+    start_fullnode_rpc_server(config, kv_store.clone(), &server_port, None).await;
 }
 
 /// Start RPC server for validators (includes transaction submission)
@@ -793,6 +842,7 @@ async fn start_fullnode_rpc_server(
     _config: Config,
     kv_store: RocksDBStore,
     server_port: &str,
+    metrics_collector: Option<Arc<crate::fullnode::MetricsCollector>>,
 ) {
     // Start JSON-RPC server for read-only queries
     let server_addr = format!("127.0.0.1:{}", server_port);
@@ -873,15 +923,38 @@ async fn start_fullnode_rpc_server(
         .expect("register view method");
 
     // Add status endpoint for fullnodes
+    let metrics_for_status = metrics_collector.clone();
     module
         .register_method("status", move |_, _, _| {
-            Ok::<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
-                "mode": "fullnode",
-                "status": "running",
-                "sync_status": "TODO: implement sync status"
-            }))
+            let status = if let Some(ref collector) = metrics_for_status {
+                let metrics = collector.get_metrics();
+                serde_json::json!({
+                    "mode": "fullnode",
+                    "status": "running",
+                    "sync": metrics.sync,
+                    "network": metrics.network,
+                    "performance": metrics.performance
+                })
+            } else {
+                serde_json::json!({
+                    "mode": "fullnode",
+                    "status": "running",
+                    "sync_status": "metrics not available"
+                })
+            };
+            Ok::<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>(status)
         })
         .expect("register status method");
+
+    // Add metrics endpoint
+    if let Some(metrics_for_endpoint) = metrics_collector {
+        module
+            .register_method("metrics", move |_, _, _| {
+                let metrics = metrics_for_endpoint.get_metrics();
+                Ok::<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>(serde_json::to_value(metrics).unwrap())
+            })
+            .expect("register metrics method");
+    }
 
     let server_handle = server.start(module);
     println!("🔌 Fullnode JSON-RPC server listening on http://{}", server_addr);

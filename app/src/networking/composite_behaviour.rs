@@ -46,6 +46,14 @@ impl GossipTopics {
     pub fn finalized_blocks_topic() -> IdentTopic {
         Topic::new("/pismo/finalized_blocks/1.0.0")
     }
+
+    pub fn block_requests_topic() -> IdentTopic {
+        Topic::new("/pismo/block_requests/1.0.0")
+    }
+
+    pub fn block_responses_topic() -> IdentTopic {
+        Topic::new("/pismo/block_responses/1.0.0")
+    }
 }
 
 impl HotstuffNetworkBehaviour {
@@ -73,12 +81,28 @@ impl HotstuffNetworkBehaviour {
             gossipsub_config,
         ).map_err(|e| anyhow::anyhow!("Failed to create gossipsub behaviour: {}", e))?;
 
-        // Subscribe to finalized blocks topic if fullnode
-        if node_mode == NodeMode::Fullnode {
-            let topic = GossipTopics::finalized_blocks_topic();
-            gossipsub.subscribe(&topic)
-                .map_err(|e| anyhow::anyhow!("Failed to subscribe to finalized blocks topic: {}", e))?;
-            info!("📡 Subscribed to finalized blocks topic (fullnode mode)");
+        // Subscribe to topics based on node mode
+        match node_mode {
+            NodeMode::Fullnode => {
+                // Fullnodes subscribe to finalized blocks and block responses
+                let finalized_topic = GossipTopics::finalized_blocks_topic();
+                gossipsub.subscribe(&finalized_topic)
+                    .map_err(|e| anyhow::anyhow!("Failed to subscribe to finalized blocks topic: {}", e))?;
+                
+                let responses_topic = GossipTopics::block_responses_topic();
+                gossipsub.subscribe(&responses_topic)
+                    .map_err(|e| anyhow::anyhow!("Failed to subscribe to block responses topic: {}", e))?;
+                
+                info!("📡 Subscribed to finalized blocks and block responses topics (fullnode mode)");
+            }
+            NodeMode::Validator => {
+                // Validators subscribe to block requests (to serve fullnodes)
+                let requests_topic = GossipTopics::block_requests_topic();
+                gossipsub.subscribe(&requests_topic)
+                    .map_err(|e| anyhow::anyhow!("Failed to subscribe to block requests topic: {}", e))?;
+                
+                info!("📡 Subscribed to block requests topic (validator mode)");
+            }
         }
 
         // Create stream behaviour for HotStuff messages
@@ -161,6 +185,42 @@ impl HotstuffNetworkBehaviour {
     /// Get the finalized blocks topic hash for subscription management
     pub fn finalized_blocks_topic_hash(&self) -> TopicHash {
         GossipTopics::finalized_blocks_topic().hash()
+    }
+
+    /// Publish a block request (fullnodes only)
+    pub fn publish_block_request(&mut self, request: crate::networking::messages::BlockRequest) -> Result<(), String> {
+        let topic = GossipTopics::block_requests_topic();
+        let serialized = serde_json::to_vec(&request)
+            .map_err(|e| format!("Failed to serialize block request: {}", e))?;
+        
+        match self.gossipsub.publish(topic, serialized) {
+            Ok(_) => {
+                info!("📤 Published block request (start: {}, end: {})", request.start_height, request.end_height);
+                Ok(())
+            }
+            Err(e) => {
+                error!("❌ Failed to publish block request: {}", e);
+                Err(format!("Gossipsub publish failed: {}", e))
+            }
+        }
+    }
+
+    /// Publish a block response (validators only)
+    pub fn publish_block_response(&mut self, response: crate::networking::messages::BlockResponse) -> Result<(), String> {
+        let topic = GossipTopics::block_responses_topic();
+        let serialized = serde_json::to_vec(&response)
+            .map_err(|e| format!("Failed to serialize block response: {}", e))?;
+        
+        match self.gossipsub.publish(topic, serialized) {
+            Ok(_) => {
+                info!("📤 Published block response (request_id: {}, {} blocks)", response.request_id, response.blocks.len());
+                Ok(())
+            }
+            Err(e) => {
+                error!("❌ Failed to publish block response: {}", e);
+                Err(format!("Gossipsub publish failed: {}", e))
+            }
+        }
     }
 }
 

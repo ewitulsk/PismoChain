@@ -69,3 +69,76 @@ impl FinalizedBlockMessage {
         self.block_data.len() + self.payload_data.len() + 64 // Approximate overhead
     }
 }
+
+/// Request for specific blocks from validators (sent by fullnodes)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockRequest {
+    /// Starting block height to request
+    pub start_height: u64,
+    /// Ending block height to request (inclusive)
+    pub end_height: u64,
+    /// Maximum number of blocks to return
+    pub max_blocks: u32,
+    /// Request ID for tracking responses
+    pub request_id: u64,
+}
+
+impl BlockRequest {
+    pub fn new(start_height: u64, end_height: u64, max_blocks: u32) -> Self {
+        Self {
+            start_height,
+            end_height,
+            max_blocks,
+            request_id: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64,
+        }
+    }
+
+    pub fn single_block(height: u64) -> Self {
+        Self::new(height, height, 1)
+    }
+
+    pub fn block_range(start: u64, end: u64) -> Self {
+        let count = (end - start + 1).min(50) as u32; // Limit to 50 blocks per request
+        Self::new(start, end, count)
+    }
+}
+
+/// Response to block requests (sent by validators)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockResponse {
+    /// Request ID this response corresponds to
+    pub request_id: u64,
+    /// List of finalized block messages
+    pub blocks: Vec<FinalizedBlockMessage>,
+    /// Whether this is the final response for the request
+    pub is_final: bool,
+    /// Error message if the request failed
+    pub error: Option<String>,
+}
+
+impl BlockResponse {
+    pub fn success(request_id: u64, blocks: Vec<FinalizedBlockMessage>, is_final: bool) -> Self {
+        Self {
+            request_id,
+            blocks,
+            is_final,
+            error: None,
+        }
+    }
+
+    pub fn error(request_id: u64, error: String) -> Self {
+        Self {
+            request_id,
+            blocks: Vec::new(),
+            is_final: true,
+            error: Some(error),
+        }
+    }
+
+    pub fn size(&self) -> usize {
+        self.blocks.iter().map(|b| b.size()).sum::<usize>() + 64 // Approximate overhead
+    }
+}
