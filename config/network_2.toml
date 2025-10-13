@@ -25,3 +25,10 @@ peer_id = "12D3KooWSVeohAvVRJ2nd6UeysRGm9GaL9BwmBwuMbiTu5HExeqU"
 multiaddrs = [
    "/ip4/127.0.0.1/udp/9001/quic-v1"
 ]
+
+[[listeners]]
+verifying_key = "a22958fe88c810de2d22d50698e4150c7dfa8a593594c580364a03c92f4757bc"
+peer_id = "12D3KooWLjNnRJsKMX32yMM2pMuo5QYQrjTmBzDmpAPtDUizfJR9"
+multiaddrs = [
+   "/ip4/127.0.0.1/udp/9002/quic-v1"
+]

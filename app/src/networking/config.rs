@@ -14,11 +14,26 @@ pub struct ValidatorConfig {
     pub multiaddrs: Vec<String>,
 }
 
+/// Configuration for a single listener in the network
+/// Listeners replicate the block tree but don't participate in consensus
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListenerConfig {
+    /// The listener's verifying key (for identification)
+    pub verifying_key: String, // hex-encoded
+    /// The listener's libp2p peer ID
+    pub peer_id: String,
+    /// List of multiaddresses where this listener can be reached
+    pub multiaddrs: Vec<String>,
+}
+
 /// Network configuration for the libp2p layer
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkConfig {
     /// List of all validators in the network
     pub validators: Vec<ValidatorConfig>,
+    /// List of all listeners in the network (optional)
+    #[serde(default)]
+    pub listeners: Vec<ListenerConfig>,
     /// Local listen addresses
     pub listen_addresses: Vec<String>,
     /// Connection timeout
@@ -41,6 +56,7 @@ impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
             validators: Vec::new(),
+            listeners: Vec::new(),
             listen_addresses: vec!["/ip4/0.0.0.0/udp/0/quic-v1".to_string()],
             connection_timeout: Some(20),
             max_connections_per_peer: Some(1),
@@ -87,6 +103,7 @@ impl NetworkRuntimeConfig {
         let mut peer_id_to_verifying_key = HashMap::new();
         let mut peer_addresses = HashMap::new();
 
+        // Process validators
         for validator in config.validators {
             // Parse verifying key
             let vk_bytes = hex::decode(&validator.verifying_key)?;
@@ -106,6 +123,31 @@ impl NetworkRuntimeConfig {
                 .map_err(|e| anyhow::anyhow!("Invalid multiaddr: {}", e))?;
 
             // Store mappings
+            verifying_key_to_peer_id.insert(verifying_key, peer_id);
+            peer_id_to_verifying_key.insert(peer_id, verifying_key);
+            peer_addresses.insert(peer_id, multiaddrs);
+        }
+
+        // Process listeners
+        for listener in config.listeners {
+            // Parse verifying key
+            let vk_bytes = hex::decode(&listener.verifying_key)?;
+            let verifying_key = VerifyingKey::try_from(vk_bytes.as_slice())
+                .map_err(|e| anyhow::anyhow!("Invalid listener verifying key: {:?}", e))?;
+
+            // Parse peer ID
+            let peer_id: PeerId = listener.peer_id.parse()
+                .map_err(|e| anyhow::anyhow!("Invalid listener peer ID: {}", e))?;
+
+            // Parse multiaddresses
+            let multiaddrs: Result<Vec<Multiaddr>, _> = listener.multiaddrs
+                .iter()
+                .map(|addr| addr.parse())
+                .collect();
+            let multiaddrs = multiaddrs
+                .map_err(|e| anyhow::anyhow!("Invalid listener multiaddr: {}", e))?;
+
+            // Store mappings (same as validators)
             verifying_key_to_peer_id.insert(verifying_key, peer_id);
             peer_id_to_verifying_key.insert(peer_id, verifying_key);
             peer_addresses.insert(peer_id, multiaddrs);
@@ -149,8 +191,14 @@ impl NetworkRuntimeConfig {
         self.peer_addresses.get(peer_id).map(|addrs| addrs.as_slice())
     }
 
-    /// Get all known peer IDs
+    /// Get all known peer IDs (validators and listeners)
     pub fn all_peer_ids(&self) -> impl Iterator<Item = PeerId> + '_ {
+        self.peer_id_to_verifying_key.keys().copied()
+    }
+
+    /// Get all peer IDs including listeners (same as all_peer_ids since listeners are now in the same map)
+    /// This method exists for clarity when broadcasting to all peers
+    pub fn all_peer_ids_including_listeners(&self) -> impl Iterator<Item = PeerId> + '_ {
         self.peer_id_to_verifying_key.keys().copied()
     }
 }

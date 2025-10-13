@@ -2,7 +2,7 @@
 # This file defines the validator network topology
 
 listen_addresses = [
-    "/ip4/0.0.0.0/udp/9000/quic-v1"
+    "/ip4/0.0.0.0/udp/9002/quic-v1"
 ]
 
 # Connection settings
