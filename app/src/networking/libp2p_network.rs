@@ -840,6 +840,7 @@ impl LibP2PNetwork {
     /// Publish a finalized block to the gossipsub network (validators only)
     pub fn publish_finalized_block(&self, message: FinalizedBlockMessage) -> Result<(), String> {
         let command = NetworkCommand::PublishFinalizedBlock { message };
+        info!("Publishing Finalized Block.");
         self.command_sender.send(command)
             .map_err(|e| format!("Failed to send publish finalized block command: {}", e))
     }

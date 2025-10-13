@@ -38,11 +38,13 @@ use hotstuff_rs::{
         validator_set::{ValidatorSet, ValidatorSetState},
         update_sets::ValidatorSetUpdates,
     },
+    events::CommitBlockEvent,
+    block_tree::accessors::public::BlockTreeCamera,
 };
 use jsonrpsee::server::ServerBuilder;
 use jsonrpsee::RpcModule;
  
-use tokio::signal;
+use tokio::{signal, time::sleep};
 use tracing::{info, error, debug, warn};
 
 use crate::{
@@ -55,7 +57,6 @@ use crate::{
 };
 use hotstuff_rs::block_tree::pluggables::KVGet;
 use jmt::JellyfishMerkleTree;
-use hotstuff_rs::block_tree::accessors::public::BlockTreeCamera;
 
 /// Setup production-ready logging
 fn setup_production_logging() {
@@ -81,6 +82,38 @@ fn setup_production_logging() {
         .init();
 
     info!("🔧 Production logging initialized (level: {})", log_level);
+}
+
+/// Publish a committed block to the gossipsub network (validators only)
+fn publish_committed_block(
+    event: &CommitBlockEvent,
+    network: &crate::networking::LibP2PNetwork,
+    kv_store: &crate::database::rocks_db::RocksDBStore,
+) {
+    use crate::pismo_app_jmt::BlockPayload;
+    use crate::networking::messages::FinalizedBlockMessage;
+    use borsh::BorshDeserialize;
+    
+    let block_hash = event.block;
+    
+    // Create a block tree camera to read the committed block
+    let block_tree_camera = BlockTreeCamera::new(kv_store.clone());
+
+    let snapshot = block_tree_camera.snapshot();
+
+    // Retrieve the block
+    match snapshot.block(&block_hash) {
+        Ok(Some(block)) => {
+            println!("Block Data Hash: {:?}", block.data_hash);
+            println!("BLOCK DATA LEN: {:?}", block.data.vec().len());
+        }
+        Ok(None) => {
+            error!("Committed block {} not found in block tree", hex::encode(block_hash.bytes()));
+        }
+        Err(e) => {
+            error!("Failed to retrieve committed block: {:?}", e);
+        }
+    }
 }
 
 /// Build validator set from network configuration
@@ -502,11 +535,24 @@ async fn run_validator_mode(
             }
         });
         
+        // Clone references for the closure
+        let network_for_publish = network.clone();
+        let kv_store_for_publish = kv_store.clone();
+        
         ReplicaSpec::builder()
             .app(pismo_app)
             .network(network)
             .kv_store(kv_store)
             .configuration(configuration)
+            .on_commit_block(move |event: &CommitBlockEvent| {
+                println!("Trying to publish commited block");
+                // This closure is called whenever a block is committed
+                publish_committed_block(
+                    event,
+                    &network_for_publish,
+                    &kv_store_for_publish
+                );
+            })
             .build()
             .start()
     } else {
@@ -519,6 +565,12 @@ async fn run_validator_mode(
             .network(MockNetwork::new(verifying_key))
             .kv_store(kv_store)
             .configuration(configuration)
+            .on_commit_block(move |event: &CommitBlockEvent| {
+                // In MockNetwork mode, we just log the block commitment
+                info!("📦 Block committed in MockNetwork mode at height {}", 
+                    event.timestamp.duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default().as_secs());
+            })
             .build()
             .start()
     };

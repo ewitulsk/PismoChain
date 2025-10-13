@@ -258,8 +258,6 @@ impl<K: KVStore> App<K> for PismoAppJMT {
             let data = Data::new(vec![Datum::new(serialized_payload)]);
             let data_hash = Self::compute_block_data_hash(&data);
 
-            // println!("📦 Empty block produced: version={}, next_version={}, root={:?}", start_version, self.next_version, hex::encode(&previous_root.0[..8]));
-
             return ProduceBlockResponse {
                 data_hash,
                 data,
@@ -279,7 +277,7 @@ impl<K: KVStore> App<K> for PismoAppJMT {
         
         // Advance the next_version counter for future blocks
         self.next_version = final_version + 1; //I REALLY don't like tracking 3 different version types.
-        println!("🔧 Non-empty block produced: final_version={}, next_version={}", final_version, self.next_version);
+        // println!("🔧 Non-empty block produced: final_version={}, next_version={}", final_version, self.next_version);
         
         // Create enhanced block payload with state root and final version
         let block_payload = BlockPayload::new(transactions_clone, state_root, start_version, final_version);
@@ -320,7 +318,7 @@ impl<K: KVStore> App<K> for PismoAppJMT {
 
         // Handle empty blocks during sync - these might be genesis or sync marker blocks
         if data.vec().is_empty() {
-            println!("🔍 Validating empty sync block with consistent hash");
+            // println!("🔍 Validating empty sync block with consistent hash");
             
             // For empty blocks during sync, validate hash consistency and return valid
             return ValidateBlockResponse::Valid {
@@ -337,8 +335,8 @@ impl<K: KVStore> App<K> for PismoAppJMT {
             let block_final_version = block_payload.final_version;
             let block_start_version = block_payload.start_version;
             
-            println!("🔍 Validating block: start_version={}, final_version={}, tx_count={}, data_len={}", 
-                block_start_version, block_final_version, block_payload.transactions.len(), data.vec().len());
+            // println!("🔍 Validating block: start_version={}, final_version={}, tx_count={}, data_len={}", 
+            //     block_start_version, block_final_version, block_payload.transactions.len(), data.vec().len());
 
             // Validate all transactions in the block (signature, chain id, nonce)
             for transaction in &block_payload.transactions {
@@ -364,7 +362,7 @@ impl<K: KVStore> App<K> for PismoAppJMT {
                 // For empty blocks, ensure validator version tracking matches producer
                 // Don't increment next_version since producer already did this
                 let expected_state_root = block_payload.state_root();
-                println!("✅ Empty block validated with state root: {:?} (version {})", expected_state_root, block_start_version);
+                // println!("✅ Empty block validated with state root: {:?} (version {})", expected_state_root, block_start_version);
                 
                 // Return without app_state_updates since no changes occurred
                 return ValidateBlockResponse::Valid {
@@ -385,7 +383,7 @@ impl<K: KVStore> App<K> for PismoAppJMT {
                 return ValidateBlockResponse::Invalid;
             }
 
-            println!("✅ Block validated successfully with state root: {:?}", computed_state_root);
+            // println!("✅ Block validated successfully with state root: {:?}", computed_state_root);
             ValidateBlockResponse::Valid {
                 app_state_updates,
                 validator_set_updates: None,
@@ -439,7 +437,7 @@ impl PismoAppJMT {
         let (state_root, mut jmt_updates) = if has_jmt_changes {
             match compute_jmt_updates(block_tree, new_version, jmt_writes) {
                 Ok((root, updates)) => {
-                    println!("🌳 Computed JMT root at version {}: {:?}", new_version, hex::encode(&root.0[..8]));
+                    // println!("🌳 Computed JMT root at version {}: {:?}", new_version, hex::encode(&root.0[..8]));
                     (root, updates)
                 }
                 Err(e) => {
@@ -453,7 +451,7 @@ impl PismoAppJMT {
             let prev_version = new_version.saturating_sub(1);
             let prev_root = get_latest_jmt_root_before(block_tree, prev_version)
                 .unwrap_or_else(|| RootHash([0u8; 32]));
-            println!("📋 No JMT changes, using latest root at/before version {}: {:?}", prev_version, hex::encode(&prev_root.0[..8]));
+            // println!("📋 No JMT changes, using latest root at/before version {}: {:?}", prev_version, hex::encode(&prev_root.0[..8]));
             (prev_root, AppStateUpdates::new())
         };
 
