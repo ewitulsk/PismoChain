@@ -46,7 +46,7 @@ use tokio::signal;
 
 use crate::{
     database::rocks_db::RocksDBStore,
-    jmt_state::{make_key_hash_from_parts, DirectJMTReader},
+    jmt_state::{make_key_hash_from_parts, DirectJMTReader, LATEST_VERSION_KEY},
     standards::book_executor::BookExecutor,
     networking::{MockNetwork, LibP2PNetwork, NetworkRuntimeConfig, load_network_config, create_libp2p_keypair_from_validator},
 };
@@ -81,6 +81,9 @@ async fn main() {
 
     // Network layer selection based on environment variable
     let use_libp2p = std::env::var("PISMO_NETWORK").unwrap_or_default() == "libp2p";
+    let node_role = std::env::var("PISMO_NODE_ROLE")
+        .unwrap_or_else(|_| "validator".to_string());
+    let is_listener = node_role.to_lowercase() == "listener";
     let validator_keys_path = std::env::var("VALIDATOR_KEYS_PATH")
         .unwrap_or_else(|_| "./validator.keys".to_string());
     let network_config_path = std::env::var("PISMO_NETWORK_CONFIG")
@@ -95,6 +98,7 @@ async fn main() {
     println!("📋 Environment Variables:");
     println!("   PISMO_NETWORK=libp2p      - Enable distributed networking (current: {})", 
         if use_libp2p { "libp2p" } else { "mock" });
+    println!("   PISMO_NODE_ROLE=listener  - Run as listener (read-only, no consensus) (current: {})", node_role);
     println!("   PISMO_INIT_STORAGE=true   - Initialize/reinitialize storage");
     println!("   PISMO_NETWORK_CONFIG=path - Network config file (current: {})", 
         network_config_path);
@@ -163,21 +167,43 @@ async fn main() {
 
     // Validate that this node is in the network config
     let my_hex_key = hex::encode(verifying_key.to_bytes());
-    let is_in_config = network_config.validators.iter().any(|v| v.verifying_key == my_hex_key);
+    let is_in_validator_config = network_config.validators.iter().any(|v| v.verifying_key == my_hex_key);
+    let is_in_listener_config = network_config.listeners.iter().any(|l| l.verifying_key == my_hex_key);
 
-    if !is_in_config {
-        eprintln!("❌ ERROR: This validator is not in the network configuration!");
-        eprintln!("   My key: {}", my_hex_key);
-        eprintln!("   Configured validators:");
-        for (i, v) in network_config.validators.iter().enumerate() {
-            eprintln!("     {}. {}", i + 1, v.verifying_key);
+    if is_listener {
+        // Listener mode: must be in listener config
+        if !is_in_listener_config {
+            eprintln!("❌ ERROR: This listener is not in the network configuration!");
+            eprintln!("   My key: {}", my_hex_key);
+            eprintln!("   Configured listeners:");
+            for (i, l) in network_config.listeners.iter().enumerate() {
+                eprintln!("     {}. {}", i + 1, l.verifying_key);
+            }
+            eprintln!("");
+            eprintln!("💡 Either:");
+            eprintln!("   - Add this listener to {} in [[listeners]] section", network_config_path);
+            eprintln!("   - Use a listener key that's already in the config");
+            eprintln!("   - Set VALIDATOR_KEYS_PATH to point to a configured listener's keys");
+            std::process::exit(1);
         }
-        eprintln!("");
-        eprintln!("💡 Either:");
-        eprintln!("   - Add this validator to {}", network_config_path);
-        eprintln!("   - Use a validator key that's already in the config");
-        eprintln!("   - Set VALIDATOR_KEYS_PATH to point to a configured validator's keys");
-        std::process::exit(1);
+        println!("👂 Running as LISTENER (read-only, no consensus participation)");
+    } else {
+        // Validator mode: must be in validator config
+        if !is_in_validator_config {
+            eprintln!("❌ ERROR: This validator is not in the network configuration!");
+            eprintln!("   My key: {}", my_hex_key);
+            eprintln!("   Configured validators:");
+            for (i, v) in network_config.validators.iter().enumerate() {
+                eprintln!("     {}. {}", i + 1, v.verifying_key);
+            }
+            eprintln!("");
+            eprintln!("💡 Either:");
+            eprintln!("   - Add this validator to {}", network_config_path);
+            eprintln!("   - Use a validator key that's already in the config");
+            eprintln!("   - Set VALIDATOR_KEYS_PATH to point to a configured validator's keys");
+            eprintln!("   - Set PISMO_NODE_ROLE=listener to run as a listener instead");
+            std::process::exit(1);
+        }
     }
 
     // Build validator set from network config
@@ -254,25 +280,44 @@ async fn main() {
     // This allows operators to explicitly control when to initialize or reinitialize storage
     // 
     // Usage scenarios:
-    // - First time setup: PISMO_INIT_STORAGE=true
+    // - First time setup (validator or listener): PISMO_INIT_STORAGE=true
     // - Join existing network: PISMO_INIT_STORAGE=false (use existing storage)  
     // - Reset node: PISMO_INIT_STORAGE=true (reinitialize with network config)
+    //
+    // Note: Both validators and listeners need initialized storage with genesis state.
+    // Listeners automatically don't participate in consensus because they're not in the validator set.
     
     // Check if initialization is needed via environment variable
     let needs_initialization = std::env::var("PISMO_INIT_STORAGE")
         .unwrap_or_else(|_| "false".to_string())
         .to_lowercase() == "true";
 
-    if needs_initialization {
-        println!("🔧 Storage initialization requested via PISMO_INIT_STORAGE=true");
-    }
+    // Check if storage is empty (no committed validator set)
+    let storage_is_empty = {
+        let block_tree_camera = BlockTreeCamera::new(kv_store.clone());
+        let snapshot = block_tree_camera.snapshot();
+        snapshot.committed_validator_set().is_err()
+    };
 
-    // Initialize if requested
-    if needs_initialization {
-        println!("🔧 Initializing replica storage with network validator set...");
+    // Force initialization if storage is empty, even if PISMO_INIT_STORAGE=false
+    let should_initialize = needs_initialization || storage_is_empty;
+
+    if should_initialize {
+        if storage_is_empty {
+            println!("🔧 Empty storage detected - initializing with genesis state...");
+        } else {
+            println!("🔧 Storage initialization requested via PISMO_INIT_STORAGE=true");
+        }
+        
         let init_app_state = PismoAppJMT::initial_app_state();
         Replica::initialize(kv_store.clone(), init_app_state, init_vs_state);
-        println!("✅ Replica storage initialized with {} validators", network_validator_set.len());
+        
+        if is_listener {
+            println!("✅ Listener storage initialized with {} validators in the validator set", network_validator_set.len());
+            println!("   This listener will replicate blocks but won't participate in consensus");
+        } else {
+            println!("✅ Validator storage initialized with {} validators", network_validator_set.len());
+        }
     } else {
         println!("📂 Using existing storage (set PISMO_INIT_STORAGE=true to reinitialize)");
         
@@ -306,6 +351,8 @@ async fn main() {
 
     // Build and start the replica with the original kv_store
     let kv_store_for_rpc = kv_store.clone(); // Clone KV store for RPC access
+    let kv_store_for_commit_handler = kv_store.clone(); // Clone KV store for commit logging
+    let is_listener_for_handler = is_listener;
     
     let replica = if use_libp2p {
         println!("🌐 Using LibP2P + QUIC networking layer");
@@ -340,11 +387,43 @@ async fn main() {
         println!("🔗 LibP2P network initialized with peer ID: {}", network.local_peer_id());
         println!("🔐 Using same Ed25519 key material for both consensus and networking");
         
+        let kv_for_commit = kv_store_for_commit_handler.clone();
+        let is_listener_commit = is_listener_for_handler;
+        
         ReplicaSpec::builder()
             .app(pismo_app)
             .network(network)
             .kv_store(kv_store)
             .configuration(configuration)
+            .on_commit_block(move |event| {
+                let node_type = if is_listener_commit { "👂 LISTENER" } else { "🔷 VALIDATOR" };
+                
+                // Use block hash from event to retrieve full block from block tree
+                let block_tree_camera = BlockTreeCamera::new(kv_for_commit.clone());
+                let snapshot = block_tree_camera.snapshot();
+                
+                if let Ok(Some(block)) = snapshot.block(&event.block) {
+                    let view = block.justify.view.int();
+                    let height = block.height.int();
+                    let tx_count = block.data.vec().len();
+                    
+                    // Read current JMT version from committed app state
+                    let jmt_version = {
+                        if let Some(version_bytes) = snapshot.committed_app_state(LATEST_VERSION_KEY) {
+                            if version_bytes.len() >= 8 {
+                                u64::from_le_bytes(version_bytes[..8].try_into().unwrap_or([0u8; 8]))
+                            } else {
+                                0
+                            }
+                        } else {
+                            0
+                        }
+                    };
+                    
+                    println!("{} committed block: view={}, height={}, txs={}, jmt_version={}", 
+                        node_type, view, height, tx_count, jmt_version);
+                }
+            })
             .build()
             .start()
     } else {
@@ -352,11 +431,43 @@ async fn main() {
         println!("   Note: MockNetwork still uses validator set from network.toml");
         println!("💡 Set PISMO_NETWORK=libp2p to enable distributed networking");
         
+        let kv_for_commit = kv_store_for_commit_handler.clone();
+        let is_listener_commit = is_listener_for_handler;
+        
         ReplicaSpec::builder()
             .app(pismo_app)
             .network(MockNetwork::new(verifying_key))
             .kv_store(kv_store)
             .configuration(configuration)
+            .on_commit_block(move |event| {
+                let node_type = if is_listener_commit { "👂 LISTENER" } else { "🔷 VALIDATOR" };
+                
+                // Use block hash from event to retrieve full block from block tree
+                let block_tree_camera = BlockTreeCamera::new(kv_for_commit.clone());
+                let snapshot = block_tree_camera.snapshot();
+                
+                if let Ok(Some(block)) = snapshot.block(&event.block) {
+                    let view = block.justify.view.int();
+                    let height = block.height.int();
+                    let tx_count = block.data.vec().len();
+                    
+                    // Read current JMT version from committed app state
+                    let jmt_version = {
+                        if let Some(version_bytes) = snapshot.committed_app_state(LATEST_VERSION_KEY) {
+                            if version_bytes.len() >= 8 {
+                                u64::from_le_bytes(version_bytes[..8].try_into().unwrap_or([0u8; 8]))
+                            } else {
+                                0
+                            }
+                        } else {
+                            0
+                        }
+                    };
+                    
+                    println!("{} committed block: view={}, height={}, txs={}, jmt_version={}", 
+                        node_type, view, height, tx_count, jmt_version);
+                }
+            })
             .build()
             .start()
     };
@@ -380,52 +491,58 @@ async fn main() {
         .expect("start jsonrpc server");
 
     let mut module = RpcModule::new(());
-    let txq = tx_queue.clone();
-    let expected_chain_id = config.chain_id;
-    module
-        .register_method("submit_borsh_tx", move |params, _mdata, _ctx| {
-            use jsonrpsee::types::ErrorObjectOwned;
-            use base64::engine::general_purpose::STANDARD as BASE64;
-            use base64::Engine;
-            println!("Recieved TX");
+    
+    // Only register transaction submission for validators
+    if !is_listener {
+        let txq = tx_queue.clone();
+        let expected_chain_id = config.chain_id;
+        module
+            .register_method("submit_borsh_tx", move |params, _mdata, _ctx| {
+                use jsonrpsee::types::ErrorObjectOwned;
+                use base64::engine::general_purpose::STANDARD as BASE64;
+                use base64::Engine;
+                println!("Recieved TX");
 
-            // Extract single base64 string param (jsonrpsee will auto-convert param errors)
-            let b64: String = params.one()?;
+                // Extract single base64 string param (jsonrpsee will auto-convert param errors)
+                let b64: String = params.one()?;
 
-            // Decode base64
-            let bytes = BASE64.decode(&b64).map_err(|e| {
-                println!("❌ Invalid base64 in submit_borsh_tx: {}", e);
-                ErrorObjectOwned::owned(-32602, "Invalid params: base64 decode failed", Some(e.to_string()))
-            })?;
-
-            println!("Decoded TX");
-
-            // Deserialize Borsh transaction
-            let tx: PismoTransaction = <PismoTransaction as borsh::BorshDeserialize>::try_from_slice(&bytes)
-                .map_err(|e| {
-                    println!("❌ Borsh deserialization failed: {}", e);
-                    ErrorObjectOwned::owned(-32602, "Invalid params: Borsh transaction decode failed", Some(e.to_string()))
+                // Decode base64
+                let bytes = BASE64.decode(&b64).map_err(|e| {
+                    println!("❌ Invalid base64 in submit_borsh_tx: {}", e);
+                    ErrorObjectOwned::owned(-32602, "Invalid params: base64 decode failed", Some(e.to_string()))
                 })?;
 
-            println!("Tx: {:?}", tx);
+                println!("Decoded TX");
 
-            // Submit + verify; surface verification errors to RPC client
-            match submit_transaction(txq.clone(), tx, expected_chain_id) {
-                Ok(_) => {
-                    println!("Successfully submitted transaction");
-                    Ok(true)
+                // Deserialize Borsh transaction
+                let tx: PismoTransaction = <PismoTransaction as borsh::BorshDeserialize>::try_from_slice(&bytes)
+                    .map_err(|e| {
+                        println!("❌ Borsh deserialization failed: {}", e);
+                        ErrorObjectOwned::owned(-32602, "Invalid params: Borsh transaction decode failed", Some(e.to_string()))
+                    })?;
+
+                println!("Tx: {:?}", tx);
+
+                // Submit + verify; surface verification errors to RPC client
+                match submit_transaction(txq.clone(), tx, expected_chain_id) {
+                    Ok(_) => {
+                        println!("Successfully submitted transaction");
+                        Ok(true)
+                    }
+                    Err(e) => {
+                        println!("❌ Transaction submission failed: {}", e);
+                        Err(ErrorObjectOwned::owned(
+                            -32001,
+                            "Transaction verification failed",
+                            Some(e.to_string()),
+                        ))
+                    }
                 }
-                Err(e) => {
-                    println!("❌ Transaction submission failed: {}", e);
-                    Err(ErrorObjectOwned::owned(
-                        -32001,
-                        "Transaction verification failed",
-                        Some(e.to_string()),
-                    ))
-                }
-            }
-        })
-        .expect("register method");
+            })
+            .expect("register method");
+    } else {
+        println!("👂 Listener mode: submit_borsh_tx disabled (read-only)");
+    }
 
     // Add view method for querying state using JMT
     let kv_store_for_view = kv_store_for_rpc.clone();
@@ -587,7 +704,11 @@ async fn main() {
 
     let server_handle = server.start(module);
     println!("🔌 JSON-RPC server listening on http://{}", server_addr);
-    println!("   Methods: submit_borsh_tx, view (types: Account, Coin, CoinStore, Link)");
+    if is_listener {
+        println!("   Methods: view (types: Account, Coin, CoinStore, Link, Orderbook) [READ-ONLY]");
+    } else {
+        println!("   Methods: submit_borsh_tx, view (types: Account, Coin, CoinStore, Link, Orderbook)");
+    }
 
     // Keep the node alive using tokio::select! (exit on RPC stop or ctrl-c)
     // The replica variable is kept in scope to prevent it from being dropped

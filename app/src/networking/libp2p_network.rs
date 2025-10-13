@@ -140,8 +140,8 @@ impl LibP2PNetwork {
             }
         }
 
-        // Start dialing known peers
-        for peer_id in config.all_peer_ids() {
+        // Start dialing known peers (validators and listeners)
+        for peer_id in config.all_peer_ids_including_listeners() {
             if peer_id != local_peer_id {
                 if let Some(addresses) = config.get_peer_addresses(&peer_id) {
                     for addr in addresses {
