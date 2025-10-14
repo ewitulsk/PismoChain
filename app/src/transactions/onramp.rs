@@ -242,9 +242,10 @@ pub fn build_onramp_updates(
     guardian_set_index: u64,
     config: &Config,
     state: &impl StateReader
-) -> (bool, (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>)) {
+) -> (bool, (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>, Vec<(String, Vec<u8>)>)) {
     let mut jmt_writes: Vec<(KeyHash, Option<OwnedValue>)> = Vec::new();
     let mut mirror: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let events: Vec<(String, Vec<u8>)> = Vec::new();
 
     // Step 1: Verify VAA and extract message
     let onramp_message = match verify_vaa_and_extract_message(vaa, guardian_set_index, config) {
@@ -254,7 +255,7 @@ pub fn build_onramp_updates(
         }
         Err(e) => {
             println!("❌ Failed to verify VAA: {}", e);
-            return (false, (jmt_writes, mirror)); // Return failure with empty updates
+            return (false, (jmt_writes, mirror, events)); // Return failure with empty updates
         }
     };
 
@@ -269,11 +270,11 @@ pub fn build_onramp_updates(
             }
             Ok(bytes) => {
                 println!("❌ Invalid recipient address length: expected 32 bytes, got {}", bytes.len());
-                return (false, (jmt_writes, mirror));
+                return (false, (jmt_writes, mirror, events));
             }
             Err(e) => {
                 println!("❌ Failed to decode recipient address: {}", e);
-                return (false, (jmt_writes, mirror));
+                return (false, (jmt_writes, mirror, events));
             }
         }
     };
@@ -337,5 +338,5 @@ pub fn build_onramp_updates(
         onramp_message.emitter_chain,
         hex::encode(&recipient_addr[..8]));
 
-    (true, (jmt_writes, mirror))
+    (true, (jmt_writes, mirror, events))
 }

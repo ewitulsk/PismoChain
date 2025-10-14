@@ -13,13 +13,13 @@ use crate::standards::accounts::{
 use crate::transactions::{SignerType, SignatureType};
 
 /// Build writes and app-mirror inserts for creating a new account
-/// Returns (success, (jmt_writes, mirror_inserts))
+/// Returns (success, (jmt_writes, mirror_inserts, events))
 pub fn build_create_account_updates(
     signature_type: SignatureType,
     signing_pub_key: String,
     _signer_type: SignerType,
     _state: &impl StateReader
-) -> (bool, (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>)) {
+) -> (bool, (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>, Vec<(String, Vec<u8>)>)) {
     let account_addr = derive_account_addr(1, signature_type, &signing_pub_key);
     let account_addr_hex = hex::encode(account_addr);
     println!("Creating account at address: {:?} (hex: {})", account_addr, account_addr_hex);
@@ -57,12 +57,14 @@ pub fn build_create_account_updates(
     let link_key = make_link_object_key(signature_type, &signing_pub_key);
     mirror.push((link_key, link_val));
 
-    (true, (jmt_writes, mirror))
+    let events: Vec<(String, Vec<u8>)> = Vec::new();
+
+    (true, (jmt_writes, mirror, events))
 }
 
 /// Build writes and app-mirror inserts for linking a new external address
 /// This function handles all the logic including nonce increment
-/// Returns (success, (jmt_writes, mirror_inserts))
+/// Returns (success, (jmt_writes, mirror_inserts, events))
 pub fn build_link_account_updates(
     signing_pub_key: String,
     external_wallet: &str,
@@ -70,9 +72,10 @@ pub fn build_link_account_updates(
     signer_address: &str,
     signer_type: SignerType,
     state: &impl StateReader
-) -> (bool, (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>)) {
+) -> (bool, (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>, Vec<(String, Vec<u8>)>)) {
     let mut jmt_writes: Vec<(KeyHash, Option<OwnedValue>)> = Vec::new();
     let mut mirror: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let events: Vec<(String, Vec<u8>)> = Vec::new();
 
     if let Some(mut account) = get_account_from_signer_state(state, &signer_address.to_string(), signer_type, signature_type, &signing_pub_key) {
         let account_addr = account.account_addr;
@@ -100,9 +103,9 @@ pub fn build_link_account_updates(
         let link_key = make_link_object_key(signature_type, external_wallet);
         mirror.push((link_key, link_val));
         
-        (true, (jmt_writes, mirror))
+        (true, (jmt_writes, mirror, events))
     } else {
-        (false, (jmt_writes, mirror))
+        (false, (jmt_writes, mirror, events))
     }
 }
 

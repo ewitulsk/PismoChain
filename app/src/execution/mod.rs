@@ -81,7 +81,7 @@ pub fn execute_transaction<K: KVStore>(
     // Execute the transaction based on its payload type
     match &transaction.payload {
         PismoOperation::Onramp(vaa, guardian_set_index) => {
-            let (success, (writes, mirrors)) = build_onramp_updates(
+            let (success, (writes, mirrors, events)) = build_onramp_updates(
                 vaa, 
                 *guardian_set_index, 
                 config, 
@@ -92,10 +92,11 @@ pub fn execute_transaction<K: KVStore>(
             }
             pending_state.apply_jmt_writes(writes);
             pending_state.apply_mirror_inserts(mirrors);
+            pending_state.apply_events(events);
         }
         
         PismoOperation::CreateAccount => {
-            let (success, (writes, mirrors)) = build_create_account_updates(
+            let (success, (writes, mirrors, events)) = build_create_account_updates(
                 signature_type, 
                 signing_pub_key, 
                 signer_type, 
@@ -106,10 +107,11 @@ pub fn execute_transaction<K: KVStore>(
             }
             pending_state.apply_jmt_writes(writes);
             pending_state.apply_mirror_inserts(mirrors);
+            pending_state.apply_events(events);
         }
         
         PismoOperation::LinkAccount { external_wallet } => {
-            let (success, (writes, mirrors)) = build_link_account_updates(
+            let (success, (writes, mirrors, events)) = build_link_account_updates(
                 signing_pub_key, 
                 external_wallet, 
                 signature_type, 
@@ -122,10 +124,11 @@ pub fn execute_transaction<K: KVStore>(
             }
             pending_state.apply_jmt_writes(writes);
             pending_state.apply_mirror_inserts(mirrors);
+            pending_state.apply_events(events);
         }
         
         PismoOperation::NoOp => {
-            let (success, (writes, mirrors)) = build_noop_updates(
+            let (success, (writes, mirrors, events)) = build_noop_updates(
                 signing_pub_key, 
                 signer_address, 
                 signer_type, 
@@ -137,6 +140,7 @@ pub fn execute_transaction<K: KVStore>(
             }
             pending_state.apply_jmt_writes(writes);
             pending_state.apply_mirror_inserts(mirrors);
+            pending_state.apply_events(events);
         }
         
         PismoOperation::NewCoin { 
@@ -147,7 +151,7 @@ pub fn execute_transaction<K: KVStore>(
             max_supply, 
             canonical_chain_id 
         } => {
-            let (success, (writes, mirrors)) = build_new_coin_updates(
+            let (success, (writes, mirrors, events)) = build_new_coin_updates(
                 name.clone(),
                 project_uri.clone(),
                 logo_uri.clone(),
@@ -165,10 +169,11 @@ pub fn execute_transaction<K: KVStore>(
             }
             pending_state.apply_jmt_writes(writes);
             pending_state.apply_mirror_inserts(mirrors);
+            pending_state.apply_events(events);
         }
         
         PismoOperation::Mint { coin_addr, account_addr, amount } => {
-            let (success, (writes, mirrors)) = build_mint_updates(
+            let (success, (writes, mirrors, events)) = build_mint_updates(
                 *coin_addr,
                 *account_addr,
                 *amount,
@@ -183,10 +188,11 @@ pub fn execute_transaction<K: KVStore>(
             }
             pending_state.apply_jmt_writes(writes);
             pending_state.apply_mirror_inserts(mirrors);
+            pending_state.apply_events(events);
         }
         
         PismoOperation::Transfer { coin_addr, receiver_addr, amount } => {
-            let (success, (writes, mirrors)) = build_transfer_updates(
+            let (success, (writes, mirrors, events)) = build_transfer_updates(
                 *coin_addr,
                 *receiver_addr,
                 *amount,
@@ -201,10 +207,11 @@ pub fn execute_transaction<K: KVStore>(
             }
             pending_state.apply_jmt_writes(writes);
             pending_state.apply_mirror_inserts(mirrors);
+            pending_state.apply_events(events);
         }
         
         PismoOperation::CreateOrderbook { buy_asset, sell_asset } => {
-            let (success, (writes, mirrors)) = build_create_orderbook_updates(
+            let (success, (writes, mirrors, events)) = build_create_orderbook_updates(
                 buy_asset.clone(),
                 sell_asset.clone(),
                 signing_pub_key,
@@ -219,6 +226,7 @@ pub fn execute_transaction<K: KVStore>(
             }
             pending_state.apply_jmt_writes(writes);
             pending_state.apply_mirror_inserts(mirrors);
+            pending_state.apply_events(events);
         }
         
         PismoOperation::NewLimitOrder { 
@@ -227,7 +235,7 @@ pub fn execute_transaction<K: KVStore>(
             amount, 
             tick_price 
         } => {
-            let (success, (writes, mirrors)) = build_new_limit_order_updates(
+            let (success, (writes, mirrors, events)) = build_new_limit_order_updates(
                 *orderbook_address,
                 *is_buy,
                 *amount,
@@ -244,6 +252,7 @@ pub fn execute_transaction<K: KVStore>(
             }
             pending_state.apply_jmt_writes(writes);
             pending_state.apply_mirror_inserts(mirrors);
+            pending_state.apply_events(events);
         }
     }
 
