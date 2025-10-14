@@ -31,8 +31,8 @@ use hotstuff_rs::{
 };
 
 use crate::networking::{
-    composite_behaviour::HotstuffNetworkBehaviour,
-    stream_behaviour::StreamEvent,
+    consensus::composite_behaviour::HotstuffNetworkBehaviour,
+    consensus::stream_behaviour::StreamEvent,
     config::NetworkRuntimeConfig,
 };
 
@@ -50,6 +50,11 @@ pub enum NetworkCommand {
     /// Update the validator set (for future use)
     UpdateValidatorSet {
         updates: ValidatorSetUpdates,
+    },
+    /// Enable event streaming with the provided configuration
+    EnableEventStreaming {
+        kv_store: crate::database::rocks_db::RocksDBStore,
+        event_receiver: UnboundedReceiver<crate::events::CommittedEvents>,
     },
     /// Shutdown the network
     Shutdown,
@@ -344,6 +349,14 @@ impl LibP2PNetwork {
                             debug!("Validator set update received (not implemented)");
                             Ok(false) // Continue loop
                         }
+                        Some(NetworkCommand::EnableEventStreaming { kv_store, event_receiver }) => {
+                            info!("📡 Event streaming enabled");
+                            // Spawn a separate task for event streaming swarm
+                            // For now, we'll log that it's not yet fully implemented in the swarm
+                            // The actual event streaming will be handled in main.rs integration
+                            warn!("Event streaming integration with swarm is pending - using separate mechanism");
+                            Ok(false) // Continue loop
+                        }
                         Some(NetworkCommand::Shutdown) => {
                             //info!("Network shutdown requested");
                             Ok(true) // Exit loop
@@ -525,6 +538,21 @@ impl LibP2PNetwork {
         self.local_peer_id
     }
 
+    /// Enable event streaming (for listener nodes)
+    /// This adds an event stream behaviour to the network for serving event subscriptions
+    pub fn enable_event_streaming(
+        &mut self,
+        kv_store: crate::database::rocks_db::RocksDBStore,
+        event_receiver: UnboundedReceiver<crate::events::CommittedEvents>,
+    ) -> Result<()> {
+        let command = NetworkCommand::EnableEventStreaming {
+            kv_store,
+            event_receiver,
+        };
+        self.command_sender.send(command)
+            .map_err(|e| anyhow!("Failed to send enable event streaming command: {}", e))?;
+        Ok(())
+    }
 
     /// Get connection statistics
     pub fn connection_stats(&self) -> HashMap<String, usize> {

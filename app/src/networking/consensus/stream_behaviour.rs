@@ -16,7 +16,7 @@ use hotstuff_rs::{
 
 use crate::networking::{
     config::NetworkRuntimeConfig,
-    stream_handler::{HotstuffStreamHandler, HandlerInEvent, HandlerOutEvent},
+    consensus::stream_handler::{HotstuffStreamHandler, HandlerInEvent, HandlerOutEvent},
 };
 use tracing::{debug, warn, info};
 

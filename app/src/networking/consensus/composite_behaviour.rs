@@ -11,7 +11,7 @@ use hotstuff_rs::{
 
 use crate::networking::{
     config::NetworkRuntimeConfig,
-    stream_behaviour::{StreamBehaviour, StreamEvent},
+    consensus::stream_behaviour::{StreamBehaviour, StreamEvent},
 };
 
 /// Unified events from the composite behaviour
@@ -23,6 +23,7 @@ pub enum CompositeEvent {
 }
 
 /// Composite NetworkBehaviour combining HotStuff streams and peer identification
+/// Note: Event streaming is NOT included here - it's managed separately in LibP2PNetwork
 #[derive(NetworkBehaviour)]
 #[behaviour(to_swarm = "CompositeEvent")]
 pub struct HotstuffNetworkBehaviour {

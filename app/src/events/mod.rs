@@ -21,6 +21,16 @@ pub struct Event {
     pub event_data: Vec<u8>,
 }
 
+/// Represents a batch of events that were committed in a block
+/// Used for distributing newly committed events to event stream subscribers
+#[derive(Clone, Debug)]
+pub struct CommittedEvents {
+    /// The version at which these events were committed
+    pub version: u64,
+    /// The events that were committed
+    pub events: Vec<Event>,
+}
+
 /// Helper to create event key for storage
 /// Format: __event__{version:u64_be}_{event_index:u32_be}
 fn make_event_key(version: u64, event_index: u32) -> Vec<u8> {
