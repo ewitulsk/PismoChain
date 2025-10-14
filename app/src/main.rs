@@ -358,6 +358,14 @@ async fn main() {
     let kv_store_for_commit_handler = kv_store.clone(); // Clone KV store for commit logging
     let is_listener_for_handler = is_listener;
     
+    // Create event streaming channel (only for listeners)
+    let (event_sender, event_receiver) = if is_listener {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    
     let replica = if use_libp2p {
         println!("🌐 Using LibP2P + QUIC networking layer");
         
@@ -380,7 +388,7 @@ async fn main() {
         };
         
         // Create LibP2P network
-        let network = match LibP2PNetwork::new(libp2p_keypair, runtime_config, verifying_key).await {
+        let mut network = match LibP2PNetwork::new(libp2p_keypair, runtime_config, verifying_key).await {
             Ok(network) => network,
             Err(e) => {
                 eprintln!("❌ Failed to initialize LibP2P network: {}", e);
@@ -391,8 +399,20 @@ async fn main() {
         println!("🔗 LibP2P network initialized with peer ID: {}", network.local_peer_id());
         println!("🔐 Using same Ed25519 key material for both consensus and networking");
         
+        // Enable event streaming if this is a listener
+        if let Some(event_rx) = event_receiver {
+            println!("📡 Enabling event streaming for listener node");
+            let kv_for_events = kv_store.clone();
+            if let Err(e) = network.enable_event_streaming(kv_for_events, event_rx) {
+                eprintln!("⚠️ Warning: Failed to enable event streaming: {}", e);
+            } else {
+                println!("✅ Event streaming enabled successfully");
+            }
+        }
+        
         let kv_for_commit = kv_store_for_commit_handler.clone();
         let is_listener_commit = is_listener_for_handler;
+        let event_sender_for_commit = event_sender.clone();
         
         ReplicaSpec::builder()
             .app(pismo_app)
@@ -439,8 +459,27 @@ async fn main() {
                             // Store all events for this block
                             if !block_payload.events.is_empty() {
                                 // Events are stored with the final_version since they represent the cumulative result
-                                if let Err(e) = store_events(&kv_for_commit, block_payload.final_version, block_payload.events) {
+                                if let Err(e) = store_events(&kv_for_commit, block_payload.final_version, block_payload.events.clone()) {
                                     eprintln!("❌ Failed to store events for version {}: {}", block_payload.final_version, e);
+                                }
+                                
+                                // Send events to event streaming channel (listener only)
+                                if let Some(ref sender) = event_sender_for_commit {
+                                    use crate::events::{Event, CommittedEvents};
+                                    let committed = CommittedEvents {
+                                        version: block_payload.final_version,
+                                        events: block_payload.events.iter().enumerate().map(|(idx, (event_type, event_data))| {
+                                            Event {
+                                                version: block_payload.final_version,
+                                                event_index: idx as u32,
+                                                event_type: event_type.clone(),
+                                                event_data: event_data.clone(),
+                                            }
+                                        }).collect(),
+                                    };
+                                    if let Err(e) = sender.send(committed) {
+                                        eprintln!("⚠️ Failed to send committed events to stream: {}", e);
+                                    }
                                 }
                             }
                         }
@@ -459,6 +498,7 @@ async fn main() {
         
         let kv_for_commit = kv_store_for_commit_handler.clone();
         let is_listener_commit = is_listener_for_handler;
+        let event_sender_for_commit = event_sender.clone();
         
         ReplicaSpec::builder()
             .app(pismo_app)
@@ -505,8 +545,27 @@ async fn main() {
                             // Store all events for this block
                             if !block_payload.events.is_empty() {
                                 // Events are stored with the final_version since they represent the cumulative result
-                                if let Err(e) = store_events(&kv_for_commit, block_payload.final_version, block_payload.events) {
+                                if let Err(e) = store_events(&kv_for_commit, block_payload.final_version, block_payload.events.clone()) {
                                     eprintln!("❌ Failed to store events for version {}: {}", block_payload.final_version, e);
+                                }
+                                
+                                // Send events to event streaming channel (listener only)
+                                if let Some(ref sender) = event_sender_for_commit {
+                                    use crate::events::{Event, CommittedEvents};
+                                    let committed = CommittedEvents {
+                                        version: block_payload.final_version,
+                                        events: block_payload.events.iter().enumerate().map(|(idx, (event_type, event_data))| {
+                                            Event {
+                                                version: block_payload.final_version,
+                                                event_index: idx as u32,
+                                                event_type: event_type.clone(),
+                                                event_data: event_data.clone(),
+                                            }
+                                        }).collect(),
+                                    };
+                                    if let Err(e) = sender.send(committed) {
+                                        eprintln!("⚠️ Failed to send committed events to stream: {}", e);
+                                    }
                                 }
                             }
                         }
