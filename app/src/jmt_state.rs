@@ -52,6 +52,9 @@ pub struct PendingBlockState<'a, K: KVStore> {
     
     /// Current version for this block execution
     pub version: Version,
+    
+    /// Events emitted during block execution (event_type, event_data)
+    pub events: Vec<(String, Vec<u8>)>,
 }
 
 impl<'a, K: KVStore> PendingBlockState<'a, K> {
@@ -62,6 +65,7 @@ impl<'a, K: KVStore> PendingBlockState<'a, K> {
             jmt_overlay: HashMap::new(),
             mirror_overlay: HashMap::new(),
             version,
+            events: Vec::new(),
         }
     }
     
@@ -77,6 +81,16 @@ impl<'a, K: KVStore> PendingBlockState<'a, K> {
         for (key, value) in inserts {
             self.mirror_overlay.insert(key, value);
         }
+    }
+    
+    /// Emit an event to be stored with this block
+    pub fn emit_event(&mut self, event_type: impl Into<String>, event_data: Vec<u8>) {
+        self.events.push((event_type.into(), event_data));
+    }
+    
+    /// Apply events from transaction builders
+    pub fn apply_events(&mut self, events: Vec<(String, Vec<u8>)>) {
+        self.events.extend(events);
     }
     
     /// Extract all accumulated JMT writes for final JMT computation

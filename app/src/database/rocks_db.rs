@@ -2,13 +2,27 @@
 
 use std::sync::Arc;
 use hotstuff_rs::block_tree::pluggables::{KVGet, KVStore, WriteBatch};
-use rocksdb::{DB, WriteBatch as RocksWb, Snapshot, WriteOptions, Options, ColumnFamilyDescriptor};
+use rocksdb::{DB, WriteBatch as RocksWb, Snapshot, WriteOptions, Options, ColumnFamilyDescriptor, IteratorMode};
 
-/// Opens a RocksDB instance with default column family only
+/// Column family names
+pub const CF_DEFAULT: &str = "default";
+pub const CF_EVENTS: &str = "events";
+pub const CF_TRANSACTIONS: &str = "transactions";
+
+/// Opens a RocksDB instance with all required column families
 fn open_db(path: &str) -> anyhow::Result<DB> {
     let mut opts = Options::default();
     opts.create_if_missing(true);
-    Ok(DB::open(&opts, path)?)
+    opts.create_missing_column_families(true);
+    
+    // Define column families
+    let cf_descriptors = vec![
+        ColumnFamilyDescriptor::new(CF_DEFAULT, Options::default()),
+        ColumnFamilyDescriptor::new(CF_EVENTS, Options::default()),
+        ColumnFamilyDescriptor::new(CF_TRANSACTIONS, Options::default()),
+    ];
+    
+    Ok(DB::open_cf_descriptors(&opts, path, cf_descriptors)?)
 }
 
 /// A production-grade RocksDB implementation of [`KVStore`].
@@ -100,5 +114,46 @@ pub struct RocksSnapshot<'a> {
 impl<'a> KVGet for RocksSnapshot<'a> {
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         self.snap.get(key).ok().flatten()
+    }
+}
+
+// Additional methods for column family operations
+impl RocksDBStore {
+    /// Get a value from a specific column family
+    pub fn get_cf(&self, cf_name: &str, key: &[u8]) -> Option<Vec<u8>> {
+        let cf = self.inner.cf_handle(cf_name)?;
+        self.inner.get_cf(&cf, key).ok().flatten()
+    }
+    
+    /// Write to a specific column family
+    pub fn write_cf(&self, cf_name: &str, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
+        let cf = self.inner.cf_handle(cf_name)
+            .ok_or_else(|| anyhow::anyhow!("Column family {} not found", cf_name))?;
+        let mut opts = WriteOptions::default();
+        opts.set_sync(true);
+        self.inner.put_cf_opt(&cf, key, value, &opts)?;
+        self.inner.flush()?;
+        Ok(())
+    }
+    
+    /// Scan a range of keys in a specific column family
+    /// Returns all key-value pairs where key >= start_key and key <= end_key (inclusive)
+    pub fn scan_range_cf(&self, cf_name: &str, start_key: &[u8], end_key: &[u8]) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let cf = self.inner.cf_handle(cf_name)
+            .ok_or_else(|| anyhow::anyhow!("Column family {} not found", cf_name))?;
+        
+        let mut results = Vec::new();
+        let iter = self.inner.iterator_cf(&cf, IteratorMode::From(start_key, rocksdb::Direction::Forward));
+        
+        for item in iter {
+            let (key, value) = item?;
+            // Stop if we've passed the end_key
+            if key.as_ref() > end_key {
+                break;
+            }
+            results.push((key.to_vec(), value.to_vec()));
+        }
+        
+        Ok(results)
     }
 }

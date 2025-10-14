@@ -9,6 +9,7 @@ mod utils;
 mod validator_keys;
 mod execution;
 mod networking;
+mod events;
 
 use std::{
     sync::{Arc, Mutex},
@@ -49,9 +50,12 @@ use crate::{
     jmt_state::{make_key_hash_from_parts, DirectJMTReader, LATEST_VERSION_KEY},
     standards::book_executor::BookExecutor,
     networking::{MockNetwork, LibP2PNetwork, NetworkRuntimeConfig, load_network_config, create_libp2p_keypair_from_validator},
+    pismo_app_jmt::BlockPayload,
+    events::{store_events, store_transaction, get_events_range, get_transactions_range},
 };
 use jmt::JellyfishMerkleTree;
 use hotstuff_rs::block_tree::accessors::public::BlockTreeCamera;
+use borsh::BorshDeserialize;
 
 /// Build validator set from network configuration
 fn build_validator_set_from_network_config(
@@ -420,6 +424,28 @@ async fn main() {
                         }
                     };
                     
+                    // Store transactions and events from the committed block
+                    if !block.data.vec().is_empty() {
+                        if let Ok(block_payload) = BlockPayload::try_from_slice(block.data.vec()[0].bytes().as_slice()) {
+                            // Store each transaction with its version
+                            let start_version = block_payload.start_version;
+                            for (i, tx) in block_payload.transactions.iter().enumerate() {
+                                let tx_version = start_version + i as u64;
+                                if let Err(e) = store_transaction(&kv_for_commit, tx_version, tx) {
+                                    eprintln!("❌ Failed to store transaction at version {}: {}", tx_version, e);
+                                }
+                            }
+                            
+                            // Store all events for this block
+                            if !block_payload.events.is_empty() {
+                                // Events are stored with the final_version since they represent the cumulative result
+                                if let Err(e) = store_events(&kv_for_commit, block_payload.final_version, block_payload.events) {
+                                    eprintln!("❌ Failed to store events for version {}: {}", block_payload.final_version, e);
+                                }
+                            }
+                        }
+                    }
+                    
                     println!("{} committed block: view={}, height={}, txs={}, jmt_version={}", 
                         node_type, view, height, tx_count, jmt_version);
                 }
@@ -463,6 +489,28 @@ async fn main() {
                             0
                         }
                     };
+                    
+                    // Store transactions and events from the committed block
+                    if !block.data.vec().is_empty() {
+                        if let Ok(block_payload) = BlockPayload::try_from_slice(block.data.vec()[0].bytes().as_slice()) {
+                            // Store each transaction with its version
+                            let start_version = block_payload.start_version;
+                            for (i, tx) in block_payload.transactions.iter().enumerate() {
+                                let tx_version = start_version + i as u64;
+                                if let Err(e) = store_transaction(&kv_for_commit, tx_version, tx) {
+                                    eprintln!("❌ Failed to store transaction at version {}: {}", tx_version, e);
+                                }
+                            }
+                            
+                            // Store all events for this block
+                            if !block_payload.events.is_empty() {
+                                // Events are stored with the final_version since they represent the cumulative result
+                                if let Err(e) = store_events(&kv_for_commit, block_payload.final_version, block_payload.events) {
+                                    eprintln!("❌ Failed to store events for version {}: {}", block_payload.final_version, e);
+                                }
+                            }
+                        }
+                    }
                     
                     println!("{} committed block: view={}, height={}, txs={}, jmt_version={}", 
                         node_type, view, height, tx_count, jmt_version);
@@ -702,12 +750,70 @@ async fn main() {
         })
         .expect("register view method");
 
+    // Add method to get events in a version range
+    let kv_store_for_events = kv_store_for_rpc.clone();
+    module
+        .register_method("get_events", move |params, _mdata, _ctx| {
+            use jsonrpsee::types::ErrorObjectOwned;
+
+            // Parse parameters: [start_version, end_version]
+            let (start_ver, end_ver): (u64, u64) = params.parse()?;
+            
+            match get_events_range(&kv_store_for_events, start_ver, end_ver) {
+                Ok(events) => {
+                    serde_json::to_value(&events).map_err(|e| {
+                        ErrorObjectOwned::owned(-32001, "Failed to serialize events", Some(e.to_string()))
+                    })
+                }
+                Err(e) => {
+                    Err(ErrorObjectOwned::owned(-32001, "Failed to query events", Some(e.to_string())))
+                }
+            }
+        })
+        .expect("register get_events method");
+
+    // Add method to get transactions in a version range
+    let kv_store_for_txs = kv_store_for_rpc.clone();
+    module
+        .register_method("get_transactions", move |params, _mdata, _ctx| {
+            use jsonrpsee::types::ErrorObjectOwned;
+            use serde_json::Value;
+
+            // Parse parameters: [start_version, end_version]
+            let (start_ver, end_ver): (u64, u64) = params.parse()?;
+            
+            match get_transactions_range(&kv_store_for_txs, start_ver, end_ver) {
+                Ok(transactions) => {
+                    // Convert transactions to a JSON-friendly format
+                    let tx_list: Vec<Value> = transactions.into_iter().map(|(version, tx)| {
+                        serde_json::json!({
+                            "version": version,
+                            "transaction": tx
+                        })
+                    }).collect();
+                    
+                    Ok(Value::Array(tx_list))
+                }
+                Err(e) => {
+                    Err(ErrorObjectOwned::owned(-32001, "Failed to query transactions", Some(e.to_string())))
+                }
+            }
+        })
+        .expect("register get_transactions method");
+
     let server_handle = server.start(module);
     println!("🔌 JSON-RPC server listening on http://{}", server_addr);
     if is_listener {
-        println!("   Methods: view (types: Account, Coin, CoinStore, Link, Orderbook) [READ-ONLY]");
+        println!("   Methods:");
+        println!("   - view (types: Account, Coin, CoinStore, Link, Orderbook) [READ-ONLY]");
+        println!("   - get_events(start_version, end_version) [READ-ONLY]");
+        println!("   - get_transactions(start_version, end_version) [READ-ONLY]");
     } else {
-        println!("   Methods: submit_borsh_tx, view (types: Account, Coin, CoinStore, Link, Orderbook)");
+        println!("   Methods:");
+        println!("   - submit_borsh_tx");
+        println!("   - view (types: Account, Coin, CoinStore, Link, Orderbook)");
+        println!("   - get_events(start_version, end_version)");
+        println!("   - get_transactions(start_version, end_version)");
     }
 
     // Keep the node alive using tokio::select! (exit on RPC stop or ctrl-c)

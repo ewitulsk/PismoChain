@@ -117,16 +117,19 @@ pub struct BlockPayload {
     pub state_root: [u8; 32], // Keep as [u8; 32] for serialization compatibility
     pub start_version: u64,
     /// Final JMT version after applying all transactions in this block
-    pub final_version: u64
+    pub final_version: u64,
+    /// Events emitted during block execution (event_type, event_data)
+    pub events: Vec<(String, Vec<u8>)>,
 }
 
 impl BlockPayload {
-    pub fn new(transactions: Vec<PismoTransaction>, state_root: RootHash, start_version: u64, final_version: u64) -> Self {
+    pub fn new(transactions: Vec<PismoTransaction>, state_root: RootHash, start_version: u64, final_version: u64, events: Vec<(String, Vec<u8>)>) -> Self {
         Self {
             transactions,
             state_root: state_root.into(), // Convert RootHash to [u8; 32]
             start_version,
-            final_version
+            final_version,
+            events,
         }
     }
     
@@ -233,7 +236,7 @@ impl<K: KVStore> App<K> for PismoAppJMT {
             
             // For empty blocks, use start_version as both start and final version
             // This maintains version consistency even with no transactions
-            let block_payload = BlockPayload::new(transactions_clone, previous_root, start_version, start_version);
+            let block_payload = BlockPayload::new(transactions_clone, previous_root, start_version, start_version, vec![]);
             let serialized_payload = block_payload.try_to_vec().unwrap();
             
             // Important: Increment next_version even for empty blocks to maintain sync
@@ -260,7 +263,7 @@ impl<K: KVStore> App<K> for PismoAppJMT {
         let block_tree = request.block_tree();
         
         // Execute transactions and get new state root using the final version
-        let (app_state_updates, state_root, final_version) = self.execute(
+        let (app_state_updates, state_root, final_version, events) = self.execute(
             &transactions_clone, 
             &block_tree, 
             start_version
@@ -270,8 +273,8 @@ impl<K: KVStore> App<K> for PismoAppJMT {
         self.next_version = final_version + 1; //I REALLY don't like tracking 3 different version types.
         println!("🔧 Non-empty block produced: final_version={}, next_version={}", final_version, self.next_version);
         
-        // Create enhanced block payload with state root and final version
-        let block_payload = BlockPayload::new(transactions_clone, state_root, start_version, final_version);
+        // Create enhanced block payload with state root, final version, and events
+        let block_payload = BlockPayload::new(transactions_clone, state_root, start_version, final_version, events);
         let serialized_payload = block_payload.try_to_vec().unwrap();
         
         let data = Data::new(vec![Datum::new(serialized_payload)]);
@@ -360,7 +363,7 @@ impl<K: KVStore> App<K> for PismoAppJMT {
             }
 
             // Execute transactions with JMT and verify state root
-            let (app_state_updates, computed_state_root, _final_version) = self.execute(&block_payload.transactions, &initial_block_tree, block_start_version);
+            let (app_state_updates, computed_state_root, _final_version, _events) = self.execute(&block_payload.transactions, &initial_block_tree, block_start_version);
             
             // Verify that the computed state root matches the proposed one
             let expected_state_root = block_payload.state_root();
@@ -372,6 +375,7 @@ impl<K: KVStore> App<K> for PismoAppJMT {
             }
 
             println!("✅ Block validated successfully with state root: {:?}", computed_state_root);
+            // Note: Events are stored after block commit in the on_commit_block callback where we have KVStore access
             ValidateBlockResponse::Valid {
                 app_state_updates,
                 validator_set_updates: None,
@@ -387,13 +391,13 @@ impl<K: KVStore> App<K> for PismoAppJMT {
 
 impl PismoAppJMT {
     /// Execute transactions using JMT read-only view, return AppStateUpdates
-    /// This follows the proper pattern: no persistence, only AppStateUpdates construction
+    /// This follows the correct pattern: no persistence, only AppStateUpdates construction
     fn execute<K: KVStore>(
         &self,
         transactions: &[PismoTransaction],
         block_tree: &AppBlockTreeView<'_, K>,
         version: u64,
-    ) -> (Option<AppStateUpdates>, RootHash, u64) {
+    ) -> (Option<AppStateUpdates>, RootHash, u64, Vec<(String, Vec<u8>)>) {
 
         // Create pending state overlay for intra-block transaction visibility
         let mut pending_state = PendingBlockState::new(block_tree, version);
@@ -415,6 +419,7 @@ impl PismoAppJMT {
         // Extract accumulated changes from pending state
         let jmt_writes = pending_state.jmt_overlay.into_iter().collect::<Vec<_>>();
         let app_mirror_inserts = pending_state.mirror_overlay.into_iter().collect::<Vec<_>>();
+        let events = pending_state.events; // Extract events before consuming pending_state
 
         let new_version = pending_state.version;
 
@@ -455,6 +460,6 @@ impl PismoAppJMT {
 
         let app_state_updates = if has_updates { Some(jmt_updates) } else { None };
         
-        (app_state_updates, state_root, new_version)
+        (app_state_updates, state_root, new_version, events)
     }
 }
