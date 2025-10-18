@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package pismo.events.v1;
+
+// Event streaming service
+service EventStream {
+  // Subscribe to events starting from a specific version
+  rpc Subscribe(SubscribeRequest) returns (stream EventBatch);
+}
+
+// Request to subscribe to events
+message SubscribeRequest {
+  uint64 start_version = 1;
+  optional uint64 end_version = 2;  // None = stream forever
+}
+
+// Batch of events
+message EventBatch {
+  repeated Event events = 1;
+  bool is_live = 2;           // Historic vs live events
+  uint64 current_version = 3; // Latest version on server
+}
+
+// Individual event
+message Event {
+  uint64 version = 1;
+  uint32 event_index = 2;
+  string event_type = 3;
+  bytes event_data = 4;  // Borsh-serialized event data
+}
+

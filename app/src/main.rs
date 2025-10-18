@@ -10,6 +10,7 @@ mod validator_keys;
 mod execution;
 mod networking;
 mod events;
+mod grpc;
 
 use std::{
     sync::{Arc, Mutex},
@@ -56,6 +57,12 @@ use crate::{
 use jmt::JellyfishMerkleTree;
 use hotstuff_rs::block_tree::accessors::public::BlockTreeCamera;
 use borsh::BorshDeserialize;
+
+/// Buffer capacity for the event broadcast channel used for live event streaming.
+/// This determines how many uncommitted events can be buffered before slow subscribers
+/// start to lag. If a subscriber lags by more than this amount, they will be disconnected
+/// to prevent memory buildup.
+const EVENT_BROADCAST_CHANNEL_CAPACITY: usize = 1000;
 
 /// Build validator set from network configuration
 fn build_validator_set_from_network_config(
@@ -349,7 +356,7 @@ async fn main() {
     println!("📊 Starting with JMT version: {}", initial_version);
 
     // Create PismoAppJMT with correct initial version
-    let pismo_app = PismoAppJMT::new(tx_queue.clone(), config.clone(), book_executor, initial_version);
+    let pismo_app = PismoAppJMT::new(tx_queue.clone(), config.clone(), book_executor, initial_version, is_listener);
     
     println!("Created Pismo App");
 
@@ -359,9 +366,10 @@ async fn main() {
     let is_listener_for_handler = is_listener;
     
     // Create event streaming channel (only for listeners)
-    let (event_sender, event_receiver) = if is_listener {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        (Some(tx), Some(rx))
+    // Use broadcast channel for gRPC - allows multiple subscribers and handles backpressure
+    let (event_broadcast_tx, event_broadcast_rx) = if is_listener {
+        let (tx, _rx) = tokio::sync::broadcast::channel(EVENT_BROADCAST_CHANNEL_CAPACITY); 
+        (Some(tx.clone()), Some(tx.subscribe()))
     } else {
         (None, None)
     };
@@ -388,7 +396,7 @@ async fn main() {
         };
         
         // Create LibP2P network
-        let mut network = match LibP2PNetwork::new(libp2p_keypair, runtime_config, verifying_key).await {
+        let network = match LibP2PNetwork::new(libp2p_keypair, runtime_config, verifying_key).await {
             Ok(network) => network,
             Err(e) => {
                 eprintln!("❌ Failed to initialize LibP2P network: {}", e);
@@ -399,20 +407,9 @@ async fn main() {
         println!("🔗 LibP2P network initialized with peer ID: {}", network.local_peer_id());
         println!("🔐 Using same Ed25519 key material for both consensus and networking");
         
-        // Enable event streaming if this is a listener
-        if let Some(event_rx) = event_receiver {
-            println!("📡 Enabling event streaming for listener node");
-            let kv_for_events = kv_store.clone();
-            if let Err(e) = network.enable_event_streaming(kv_for_events, event_rx) {
-                eprintln!("⚠️ Warning: Failed to enable event streaming: {}", e);
-            } else {
-                println!("✅ Event streaming enabled successfully");
-            }
-        }
-        
         let kv_for_commit = kv_store_for_commit_handler.clone();
         let is_listener_commit = is_listener_for_handler;
-        let event_sender_for_commit = event_sender.clone();
+        let event_broadcast_for_commit = event_broadcast_tx.clone();
         
         ReplicaSpec::builder()
             .app(pismo_app)
@@ -446,6 +443,7 @@ async fn main() {
                     
                     // Store transactions and events from the committed block
                     if !block.data.vec().is_empty() {
+                        println!("Block Data Vec Isnt Empty");
                         if let Ok(block_payload) = BlockPayload::try_from_slice(block.data.vec()[0].bytes().as_slice()) {
                             // Store each transaction with its version
                             let start_version = block_payload.start_version;
@@ -458,13 +456,14 @@ async fn main() {
                             
                             // Store all events for this block
                             if !block_payload.events.is_empty() {
+                                println!("EVENTS WASNT EMPTY, TRYING TO SEND");
                                 // Events are stored with the final_version since they represent the cumulative result
                                 if let Err(e) = store_events(&kv_for_commit, block_payload.final_version, block_payload.events.clone()) {
                                     eprintln!("❌ Failed to store events for version {}: {}", block_payload.final_version, e);
                                 }
                                 
                                 // Send events to event streaming channel (listener only)
-                                if let Some(ref sender) = event_sender_for_commit {
+                                if let Some(ref sender) = event_broadcast_for_commit {
                                     use crate::events::{Event, CommittedEvents};
                                     let committed = CommittedEvents {
                                         version: block_payload.final_version,
@@ -477,16 +476,18 @@ async fn main() {
                                             }
                                         }).collect(),
                                     };
-                                    if let Err(e) = sender.send(committed) {
-                                        eprintln!("⚠️ Failed to send committed events to stream: {}", e);
-                                    }
+                                    // Broadcast channel - if no receivers, that's ok
+                                    let _ = sender.send(committed);
                                 }
                             }
                         }
                     }
-                    
-                    println!("{} committed block: view={}, height={}, txs={}, jmt_version={}", 
-                        node_type, view, height, tx_count, jmt_version);
+
+                    // Only print commit message for non-empty blocks on listeners
+                    if tx_count > 0 {
+                        println!("{} committed block: view={}, height={}, txs={}, jmt_version={}", 
+                            node_type, view, height, tx_count, jmt_version);
+                    }
                 }
             })
             .build()
@@ -498,7 +499,7 @@ async fn main() {
         
         let kv_for_commit = kv_store_for_commit_handler.clone();
         let is_listener_commit = is_listener_for_handler;
-        let event_sender_for_commit = event_sender.clone();
+        let event_broadcast_for_commit = event_broadcast_tx.clone();
         
         ReplicaSpec::builder()
             .app(pismo_app)
@@ -550,7 +551,7 @@ async fn main() {
                                 }
                                 
                                 // Send events to event streaming channel (listener only)
-                                if let Some(ref sender) = event_sender_for_commit {
+                                if let Some(ref sender) = event_broadcast_for_commit {
                                     use crate::events::{Event, CommittedEvents};
                                     let committed = CommittedEvents {
                                         version: block_payload.final_version,
@@ -563,16 +564,18 @@ async fn main() {
                                             }
                                         }).collect(),
                                     };
-                                    if let Err(e) = sender.send(committed) {
-                                        eprintln!("⚠️ Failed to send committed events to stream: {}", e);
-                                    }
+                                    // Broadcast channel - if no receivers, that's ok
+                                    let _ = sender.send(committed);
                                 }
                             }
                         }
                     }
                     
-                    println!("{} committed block: view={}, height={}, txs={}, jmt_version={}", 
-                        node_type, view, height, tx_count, jmt_version);
+                    // Only print commit message for non-empty blocks on listeners
+                    if !is_listener_commit || tx_count > 0 {
+                        println!("{} committed block: view={}, height={}, txs={}, jmt_version={}", 
+                            node_type, view, height, tx_count, jmt_version);
+                    }
                 }
             })
             .build()
@@ -588,6 +591,38 @@ async fn main() {
         println!("🔧 Network: MockNetwork (single node development)");
     }
     println!("================================================================");
+
+    // Start gRPC event streaming server (listener nodes only)
+    if is_listener {
+        if let (Some(broadcast_tx), Some(_broadcast_rx)) = (event_broadcast_tx.clone(), event_broadcast_rx) {
+            let grpc_port = std::env::var("PISMO_GRPC_PORT")
+                .unwrap_or_else(|_| "50051".to_string());
+            
+            let event_service = grpc::EventStreamService::new(
+                kv_store_for_rpc.clone(),
+                broadcast_tx,
+            );
+            
+            let addr = format!("0.0.0.0:{}", grpc_port).parse()
+                .expect("Failed to parse gRPC address");
+            
+            tokio::spawn(async move {
+                use grpc::proto::event_stream_server::EventStreamServer;
+                
+                println!("📡 Starting gRPC event streaming on port {}", grpc_port);
+                
+                if let Err(e) = tonic::transport::Server::builder()
+                    .add_service(EventStreamServer::new(event_service))
+                    .serve(addr)
+                    .await
+                {
+                    eprintln!("❌ gRPC server error: {}", e);
+                }
+            });
+            
+            println!("📡 gRPC event streaming enabled on port {}", std::env::var("PISMO_GRPC_PORT").unwrap_or_else(|_| "50051".to_string()));
+        }
+    }
 
     // Start JSON-RPC server to accept transactions (async)
     let server_addr = format!("127.0.0.1:{}", server_port);
