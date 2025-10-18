@@ -31,6 +31,15 @@ pub struct CommittedEvents {
     pub events: Vec<Event>,
 }
 
+/// Transfer event emitted for mint and transfer operations
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+pub struct TransferEvent {
+    pub from_coinstore: [u8; 32],
+    pub to_coinstore: [u8; 32],
+    pub coin_address: [u8; 32],
+    pub amount: u128,
+}
+
 /// Helper to create event key for storage
 /// Format: __event__{version:u64_be}_{event_index:u32_be}
 fn make_event_key(version: u64, event_index: u32) -> Vec<u8> {

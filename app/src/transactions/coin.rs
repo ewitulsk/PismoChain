@@ -1,5 +1,6 @@
 use std::vec;
 use jmt::{KeyHash, OwnedValue};
+use borsh::BorshSerialize;
 
 use crate::jmt_state::{make_key_hash_from_parts, StateReader};
 use crate::standards::accounts::{
@@ -11,6 +12,7 @@ use crate::standards::coin::{
     get_coin_from_state, get_coin_store_from_state,
 };
 use crate::transactions::{SignerType, SignatureType};
+use crate::events::TransferEvent;
 
 /// Build writes and app-mirror inserts for creating a new token
 /// Returns (success, (jmt_writes, mirror_inserts, events))
@@ -90,7 +92,7 @@ pub fn build_mint_updates(
 ) -> (bool, (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>, Vec<(String, Vec<u8>)>)) {
     let mut jmt_writes: Vec<(KeyHash, Option<OwnedValue>)> = Vec::new();
     let mut mirror: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    let events: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut events: Vec<(String, Vec<u8>)> = Vec::new();
 
     // Check both coin and account existence at the start
     if let (Some(mut coin), Some(mut account)) = (
@@ -140,6 +142,15 @@ pub fn build_mint_updates(
         jmt_writes.push((store_jmt_key, Some(store_bytes.clone())));
         mirror.push((make_coin_store_object_key(&coin_store_addr), store_bytes));
         
+        // Emit Transfer event (from 0x00 for mint)
+        let transfer_event = TransferEvent {
+            from_coinstore: [0u8; 32],
+            to_coinstore: coin_store_addr,
+            coin_address: coin_addr,
+            amount,
+        };
+        events.push(("Transfer".to_string(), transfer_event.try_to_vec().unwrap()));
+        
         // Serialize the updated account
         let account_bytes = <crate::standards::accounts::Account as borsh::BorshSerialize>::try_to_vec(&account).unwrap();
         let account_jmt_key = make_key_hash_from_parts(account_addr_local, b"acct");
@@ -168,7 +179,7 @@ pub fn build_transfer_updates(
 ) -> (bool, (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>, Vec<(String, Vec<u8>)>)) {
     let mut jmt_writes: Vec<(KeyHash, Option<OwnedValue>)> = Vec::new();
     let mut mirror: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    let events: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut events: Vec<(String, Vec<u8>)> = Vec::new();
 
     // Check both coin and sender account existence at the start
     if let (Some(_coin), Some(mut sender_account)) = (
@@ -214,11 +225,21 @@ pub fn build_transfer_updates(
                 jmt_writes.push((receiver_store_jmt_key, Some(receiver_store_bytes.clone())));
                 mirror.push((make_coin_store_object_key(&receiver_store_addr), receiver_store_bytes));
                 
+                // Emit Transfer event
+                let transfer_event = TransferEvent {
+                    from_coinstore: sender_store_addr,
+                    to_coinstore: receiver_store_addr,
+                    coin_address: coin_addr,
+                    amount,
+                };
+                
                 // Serialize and store the updated sender's account (with incremented nonce)
                 let account_bytes = <crate::standards::accounts::Account as borsh::BorshSerialize>::try_to_vec(&sender_account).unwrap();
                 let account_jmt_key = make_key_hash_from_parts(sender_account_addr, b"acct");
                 jmt_writes.push((account_jmt_key, Some(account_bytes.clone())));
                 mirror.push((make_account_object_key(&sender_account_addr), account_bytes));
+
+                events.push(("Transfer".to_string(), transfer_event.try_to_vec().unwrap()));
                 
                 println!("✅ Transfer successful: {} tokens from {:?} to {:?}", 
                     amount, hex::encode(&sender_account_addr[..8]), hex::encode(&receiver_addr[..8]));

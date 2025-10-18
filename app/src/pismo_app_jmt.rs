@@ -156,16 +156,18 @@ pub struct PismoAppJMT {
     config: Config,
     next_version: u64, // JMT version counter - increments with each transaction
     book_executor: BookExecutor, // Orderbook tracking
+    is_listener: bool, // Whether this node is a listener (read-only)
 }
 
 impl PismoAppJMT {
     /// Create a new JMT-enhanced counter app
-    pub fn new(tx_queue: Arc<Mutex<Vec<PismoTransaction>>>, config: Config, book_executor: BookExecutor, initial_version: u64) -> Self {
+    pub fn new(tx_queue: Arc<Mutex<Vec<PismoTransaction>>>, config: Config, book_executor: BookExecutor, initial_version: u64, is_listener: bool) -> Self {
         Self {
             tx_queue,
             config,
             next_version: initial_version,
             book_executor,
+            is_listener,
         }
     }
 
@@ -326,8 +328,11 @@ impl<K: KVStore> App<K> for PismoAppJMT {
             let block_final_version = block_payload.final_version;
             let block_start_version = block_payload.start_version;
             
-            println!("🔍 Validating block: start_version={}, final_version={}, tx_count={}", 
-                block_start_version, block_final_version, block_payload.transactions.len());
+            // Only print validation message for non-empty blocks on listeners
+            if !self.is_listener || !block_payload.transactions.is_empty() {
+                println!("🔍 Validating block: start_version={}, final_version={}, tx_count={}", 
+                    block_start_version, block_final_version, block_payload.transactions.len());
+            }
 
             // Validate all transactions in the block (signature, chain id, nonce)
             for transaction in &block_payload.transactions {
@@ -353,7 +358,11 @@ impl<K: KVStore> App<K> for PismoAppJMT {
                 // For empty blocks, ensure validator version tracking matches producer
                 // Don't increment next_version since producer already did this
                 let expected_state_root = block_payload.state_root();
-                println!("✅ Empty block validated with state root: {:?} (version {})", expected_state_root, block_start_version);
+                
+                // Only print validation success for validators
+                if !self.is_listener {
+                    println!("✅ Empty block validated with state root: {:?} (version {})", expected_state_root, block_start_version);
+                }
                 
                 // Return without app_state_updates since no changes occurred
                 return ValidateBlockResponse::Valid {

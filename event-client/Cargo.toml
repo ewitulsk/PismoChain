@@ -1,0 +1,20 @@
+[package]
+name = "pismo-event-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tonic = "0.11"
+prost = "0.12"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio-stream = "0.1"
+futures = "0.3"
+anyhow = "1.0"
+thiserror = "1.0"
+
+[build-dependencies]
+tonic-build = "0.11"
+
+[dev-dependencies]
+hex = "0.4"
+borsh = { version = "1.5", features = ["derive"] }
