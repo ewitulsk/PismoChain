@@ -1,0 +1,32 @@
+[package]
+name = "pismo-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "pismo-cli"
+path = "src/main.rs"
+
+[dependencies]
+# CLI framework
+clap = { version = "4.5", features = ["derive"] }
+
+# Error handling
+anyhow = "1.0"
+
+# JSON output
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Hex encoding
+hex = "0.4"
+
+# Reference app crate for key utilities
+pismo_chain = { package = "PismoChain", path = "../app" }
+
+# LibP2P for PeerId derivation
+libp2p-identity = { version = "0.2", features = ["ed25519"] }
+
+# HotStuff for SigningKey types
+hotstuff_rs = { path = "../hotstuff_rs" }
+

@@ -3,6 +3,10 @@ name = "PismoChain"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "pismo_chain"
+path = "src/lib.rs"
+
 [[bin]]
 name = "pismochain"
 path = "src/main.rs"
