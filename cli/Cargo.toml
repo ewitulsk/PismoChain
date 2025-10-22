@@ -30,3 +30,9 @@ libp2p-identity = { version = "0.2", features = ["ed25519"] }
 # HotStuff for SigningKey types
 hotstuff_rs = { path = "../hotstuff_rs" }
 
+# Event streaming
+pismo-event-client = { path = "../event-client" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+futures = "0.3"
+borsh = "0.10"
+

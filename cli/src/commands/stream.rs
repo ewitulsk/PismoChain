@@ -1,61 +1,28 @@
-//! Simple example showing how to stream events from a PismoChain listener
-//!
-//! This example demonstrates the basic usage of the event client SDK.
-//!
-//! Run with:
-//! ```bash
-//! cargo run --example simple_stream -- <grpc_endpoint> <start_version>
-//! ```
-//!
-//! Example:
-//! ```bash
-//! cargo run --example simple_stream -- http://127.0.0.1:50051 0
-//! ```
-
-use pismo_event_client::{EventStreamClient, Event, Result};
+use anyhow::{Context, Result};
+use pismo_event_client::{EventStreamClient, Event};
 use futures::StreamExt;
-use std::env;
-use borsh::{BorshDeserialize, BorshSerialize};
+use borsh::BorshDeserialize;
+use pismo_chain::events::TransferEvent;
 
-/// Transfer event emitted for mint and transfer operations
-#[derive(Debug, BorshSerialize, BorshDeserialize)]
-pub struct TransferEvent {
-    pub from_coinstore: [u8; 32],
-    pub to_coinstore: [u8; 32],
-    pub coin_address: [u8; 32],
-    pub amount: u128,
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Parse command line arguments
-    let args: Vec<String> = env::args().collect();
-    
-    let endpoint = if args.len() >= 2 {
-        args[1].clone()
-    } else {
-        "http://127.0.0.1:50051".to_string()
-    };
-    
-    let start_version: u64 = if args.len() >= 3 {
-        args[2].parse().expect("start_version must be a valid u64")
-    } else {
-        0
-    };
-    
-    println!("Connecting to listener: {}", endpoint);
-    println!("Starting from version: {}", start_version);
-    println!();
+pub async fn stream_events_command(endpoint: &str, start_version: u64, end_version: Option<u64>) -> Result<()> {
+    eprintln!("Connecting to listener: {}", endpoint);
+    eprintln!("Starting from version: {}", start_version);
+    if let Some(end) = end_version {
+        eprintln!("Ending at version: {}", end);
+    }
+    eprintln!();
     
     // Connect to the listener node
-    let mut client = EventStreamClient::connect(&endpoint).await?;
+    let mut client = EventStreamClient::connect(endpoint).await
+        .context("Failed to connect to listener node")?;
     
-    println!("Successfully connected! Streaming events...");
-    println!("Press Ctrl+C to stop");
-    println!();
+    eprintln!("Successfully connected! Streaming events...");
+    eprintln!("Press Ctrl+C to stop");
+    eprintln!();
     
     // Subscribe to events
-    let mut event_stream = client.subscribe(start_version, None).await?;
+    let mut event_stream = client.subscribe(start_version, end_version).await
+        .context("Failed to subscribe to events")?;
     
     // Stream and print events
     let mut event_count = 0;
@@ -67,7 +34,7 @@ async fn main() -> Result<()> {
                 
                 // Print a summary every 100 events
                 if event_count % 100 == 0 {
-                    println!("--- Received {} events so far ---", event_count);
+                    eprintln!("--- Received {} events so far ---", event_count);
                 }
             }
             Err(e) => {
@@ -78,8 +45,8 @@ async fn main() -> Result<()> {
         }
     }
     
-    println!();
-    println!("Stream completed. Total events received: {}", event_count);
+    eprintln!();
+    eprintln!("Stream completed. Total events received: {}", event_count);
     
     Ok(())
 }
@@ -96,7 +63,7 @@ fn print_event(event: &Event) {
     
     // Deserialize Transfer events
     if event.event_type == "Transfer" {
-        match TransferEvent::try_from_slice(&event.event_data) {
+        match <TransferEvent as BorshDeserialize>::try_from_slice(&event.event_data) {
             Ok(transfer) => {
                 let is_mint = transfer.from_coinstore == [0u8; 32];
                 println!("│");
@@ -132,3 +99,4 @@ fn print_event(event: &Event) {
     
     println!("└─");
 }
+
