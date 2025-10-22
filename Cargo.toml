@@ -1,5 +1,5 @@
 [workspace]
-members = ["app", "hotstuff_rs", "event-client"]
+members = ["app", "hotstuff_rs", "event-client", "cli"]
 resolver = "2"
 
 [workspace.package]
