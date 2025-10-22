@@ -85,6 +85,123 @@ fn build_validator_set_from_network_config(
     Ok(validator_set)
 }
 
+/// Shared commit handler logic for both libp2p and MockNetwork
+fn handle_commit_block(
+    event: &hotstuff_rs::events::CommitBlockEvent,
+    kv_store: &RocksDBStore,
+    is_listener: bool,
+    event_broadcast_tx: Option<&tokio::sync::broadcast::Sender<crate::events::CommittedEvents>>,
+) {
+    let node_type = if is_listener { "👂 LISTENER" } else { "🔷 VALIDATOR" };
+    
+    // Use block hash from event to retrieve full block from block tree
+    let block_tree_camera = BlockTreeCamera::new(kv_store.clone());
+    let snapshot = block_tree_camera.snapshot();
+    
+    if let Ok(Some(block)) = snapshot.block(&event.block) {
+        let view = block.justify.view.int();
+        let height = block.height.int();
+        
+        // Read current JMT version from committed app state
+        let jmt_version = {
+            if let Some(version_bytes) = snapshot.committed_app_state(LATEST_VERSION_KEY) {
+                if version_bytes.len() >= 8 {
+                    u64::from_le_bytes(version_bytes[..8].try_into().unwrap_or([0u8; 8]))
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        };
+        
+        // Debug: Check block data length first
+        println!("🔎 on_commit_block: Checking block data for hash: {:?}", hex::encode(&event.block.bytes()[..8]));
+        let data_len = snapshot.block_data_len(&event.block);
+        match &data_len {
+            Ok(Some(len)) => println!("   block_data_len: {} datums", len.int()),
+            Ok(None) => println!("   block_data_len: None"),
+            Err(e) => println!("   block_data_len error: {:?}", e),
+        }
+        
+        // Fetch block data separately (hotstuff-rs stores block data separately from block metadata)
+        let block_data = match snapshot.block_data(&event.block) {
+            Ok(Some(data)) => {
+                println!("✅ Fetched Block Data: {} datums", data.vec().len());
+                if !data.vec().is_empty() {
+                    println!("   First datum size: {} bytes", data.vec()[0].bytes().len());
+                }
+                data
+            },
+            Ok(None) => {
+                println!("⚠️  No block data found for block hash: {:?}", event.block);
+                return;
+            }
+            Err(e) => {
+                eprintln!("❌ Failed to retrieve block data: {:?}", e);
+                return;
+            }
+        };
+        
+        // Store transactions and events from the committed block, and get actual tx count
+        let tx_count = if !block_data.vec().is_empty() {
+            println!("Block Data Not Empty!");
+            if let Ok(block_payload) = BlockPayload::try_from_slice(block_data.vec()[0].bytes().as_slice()) {
+                let transaction_count = block_payload.transactions.len();
+                
+                println!("Tx Count: {:?}", transaction_count);
+
+                // Store each transaction with its version
+                let start_version = block_payload.start_version;
+                for (i, tx) in block_payload.transactions.iter().enumerate() {
+                    let tx_version = start_version + i as u64;
+                    if let Err(e) = store_transaction(kv_store, tx_version, tx) {
+                        eprintln!("❌ Failed to store transaction at version {}: {}", tx_version, e);
+                    }
+                }
+                
+                // Store all events for this block
+                if !block_payload.events.is_empty() {
+                    // Events are stored with the final_version since they represent the cumulative result
+                    if let Err(e) = store_events(kv_store, block_payload.final_version, block_payload.events.clone()) {
+                        eprintln!("❌ Failed to store events for version {}: {}", block_payload.final_version, e);
+                    }
+                    
+                    // Send events to event streaming channel (listener only)
+                    if let Some(sender) = event_broadcast_tx {
+                        use crate::events::{Event, CommittedEvents};
+                        let committed = CommittedEvents {
+                            version: block_payload.final_version,
+                            events: block_payload.events.iter().enumerate().map(|(idx, (event_type, event_data))| {
+                                Event {
+                                    version: block_payload.final_version,
+                                    event_index: idx as u32,
+                                    event_type: event_type.clone(),
+                                    event_data: event_data.clone(),
+                                }
+                            }).collect(),
+                        };
+                        // Broadcast channel - if no receivers, that's ok
+                        let _ = sender.send(committed);
+                    }
+                }
+                
+                transaction_count
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        
+        // Print commit message for blocks with transactions
+        if tx_count > 0 {
+            println!("{} committed block: view={}, height={}, txs={}, jmt_version={}", 
+                node_type, view, height, tx_count, jmt_version);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
 
@@ -417,78 +534,12 @@ async fn main() {
             .kv_store(kv_store)
             .configuration(configuration)
             .on_commit_block(move |event| {
-                let node_type = if is_listener_commit { "👂 LISTENER" } else { "🔷 VALIDATOR" };
-                
-                // Use block hash from event to retrieve full block from block tree
-                let block_tree_camera = BlockTreeCamera::new(kv_for_commit.clone());
-                let snapshot = block_tree_camera.snapshot();
-                
-                if let Ok(Some(block)) = snapshot.block(&event.block) {
-                    let view = block.justify.view.int();
-                    let height = block.height.int();
-                    let tx_count = block.data.vec().len();
-                    
-                    // Read current JMT version from committed app state
-                    let jmt_version = {
-                        if let Some(version_bytes) = snapshot.committed_app_state(LATEST_VERSION_KEY) {
-                            if version_bytes.len() >= 8 {
-                                u64::from_le_bytes(version_bytes[..8].try_into().unwrap_or([0u8; 8]))
-                            } else {
-                                0
-                            }
-                        } else {
-                            0
-                        }
-                    };
-                    
-                    // Store transactions and events from the committed block
-                    if !block.data.vec().is_empty() {
-                        println!("Block Data Vec Isnt Empty");
-                        if let Ok(block_payload) = BlockPayload::try_from_slice(block.data.vec()[0].bytes().as_slice()) {
-                            // Store each transaction with its version
-                            let start_version = block_payload.start_version;
-                            for (i, tx) in block_payload.transactions.iter().enumerate() {
-                                let tx_version = start_version + i as u64;
-                                if let Err(e) = store_transaction(&kv_for_commit, tx_version, tx) {
-                                    eprintln!("❌ Failed to store transaction at version {}: {}", tx_version, e);
-                                }
-                            }
-                            
-                            // Store all events for this block
-                            if !block_payload.events.is_empty() {
-                                println!("EVENTS WASNT EMPTY, TRYING TO SEND");
-                                // Events are stored with the final_version since they represent the cumulative result
-                                if let Err(e) = store_events(&kv_for_commit, block_payload.final_version, block_payload.events.clone()) {
-                                    eprintln!("❌ Failed to store events for version {}: {}", block_payload.final_version, e);
-                                }
-                                
-                                // Send events to event streaming channel (listener only)
-                                if let Some(ref sender) = event_broadcast_for_commit {
-                                    use crate::events::{Event, CommittedEvents};
-                                    let committed = CommittedEvents {
-                                        version: block_payload.final_version,
-                                        events: block_payload.events.iter().enumerate().map(|(idx, (event_type, event_data))| {
-                                            Event {
-                                                version: block_payload.final_version,
-                                                event_index: idx as u32,
-                                                event_type: event_type.clone(),
-                                                event_data: event_data.clone(),
-                                            }
-                                        }).collect(),
-                                    };
-                                    // Broadcast channel - if no receivers, that's ok
-                                    let _ = sender.send(committed);
-                                }
-                            }
-                        }
-                    }
-
-                    // Only print commit message for non-empty blocks on listeners
-                    if tx_count > 0 {
-                        println!("{} committed block: view={}, height={}, txs={}, jmt_version={}", 
-                            node_type, view, height, tx_count, jmt_version);
-                    }
-                }
+                handle_commit_block(
+                    &event,
+                    &kv_for_commit,
+                    is_listener_commit,
+                    event_broadcast_for_commit.as_ref(),
+                );
             })
             .build()
             .start()
@@ -507,76 +558,12 @@ async fn main() {
             .kv_store(kv_store)
             .configuration(configuration)
             .on_commit_block(move |event| {
-                let node_type = if is_listener_commit { "👂 LISTENER" } else { "🔷 VALIDATOR" };
-                
-                // Use block hash from event to retrieve full block from block tree
-                let block_tree_camera = BlockTreeCamera::new(kv_for_commit.clone());
-                let snapshot = block_tree_camera.snapshot();
-                
-                if let Ok(Some(block)) = snapshot.block(&event.block) {
-                    let view = block.justify.view.int();
-                    let height = block.height.int();
-                    let tx_count = block.data.vec().len();
-                    
-                    // Read current JMT version from committed app state
-                    let jmt_version = {
-                        if let Some(version_bytes) = snapshot.committed_app_state(LATEST_VERSION_KEY) {
-                            if version_bytes.len() >= 8 {
-                                u64::from_le_bytes(version_bytes[..8].try_into().unwrap_or([0u8; 8]))
-                            } else {
-                                0
-                            }
-                        } else {
-                            0
-                        }
-                    };
-                    
-                    // Store transactions and events from the committed block
-                    if !block.data.vec().is_empty() {
-                        if let Ok(block_payload) = BlockPayload::try_from_slice(block.data.vec()[0].bytes().as_slice()) {
-                            // Store each transaction with its version
-                            let start_version = block_payload.start_version;
-                            for (i, tx) in block_payload.transactions.iter().enumerate() {
-                                let tx_version = start_version + i as u64;
-                                if let Err(e) = store_transaction(&kv_for_commit, tx_version, tx) {
-                                    eprintln!("❌ Failed to store transaction at version {}: {}", tx_version, e);
-                                }
-                            }
-                            
-                            // Store all events for this block
-                            if !block_payload.events.is_empty() {
-                                // Events are stored with the final_version since they represent the cumulative result
-                                if let Err(e) = store_events(&kv_for_commit, block_payload.final_version, block_payload.events.clone()) {
-                                    eprintln!("❌ Failed to store events for version {}: {}", block_payload.final_version, e);
-                                }
-                                
-                                // Send events to event streaming channel (listener only)
-                                if let Some(ref sender) = event_broadcast_for_commit {
-                                    use crate::events::{Event, CommittedEvents};
-                                    let committed = CommittedEvents {
-                                        version: block_payload.final_version,
-                                        events: block_payload.events.iter().enumerate().map(|(idx, (event_type, event_data))| {
-                                            Event {
-                                                version: block_payload.final_version,
-                                                event_index: idx as u32,
-                                                event_type: event_type.clone(),
-                                                event_data: event_data.clone(),
-                                            }
-                                        }).collect(),
-                                    };
-                                    // Broadcast channel - if no receivers, that's ok
-                                    let _ = sender.send(committed);
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Only print commit message for non-empty blocks on listeners
-                    if !is_listener_commit || tx_count > 0 {
-                        println!("{} committed block: view={}, height={}, txs={}, jmt_version={}", 
-                            node_type, view, height, tx_count, jmt_version);
-                    }
-                }
+                handle_commit_block(
+                    &event,
+                    &kv_for_commit,
+                    is_listener_commit,
+                    event_broadcast_for_commit.as_ref(),
+                );
             })
             .build()
             .start()

@@ -279,13 +279,16 @@ impl<K: KVStore> App<K> for PismoAppJMT {
         let block_payload = BlockPayload::new(transactions_clone, state_root, start_version, final_version, events);
         let serialized_payload = block_payload.try_to_vec().unwrap();
         
-        let data = Data::new(vec![Datum::new(serialized_payload)]);
+        let data = Data::new(vec![Datum::new(serialized_payload.clone())]);
         let data_hash = {
             let mut hasher = CryptoHasher::new();
             hasher.update(&data.vec()[0].bytes());
             let bytes = hasher.finalize().into();
             CryptoHash::new(bytes)
         };
+
+        println!("📦 produce_block: Created Data with {} datums, first datum size: {} bytes", 
+            data.vec().len(), serialized_payload.len());
 
         ProduceBlockResponse {
             data_hash,
@@ -307,6 +310,12 @@ impl<K: KVStore> App<K> for PismoAppJMT {
         request: ValidateBlockRequest<K>,
     ) -> ValidateBlockResponse {
         let data = &request.proposed_block().data;
+        
+        println!("🔍 validate_block: Received block with {} datums", data.vec().len());
+        if !data.vec().is_empty() {
+            println!("   First datum size: {} bytes", data.vec()[0].bytes().len());
+        }
+        
         let data_hash: CryptoHash = {
             let mut hasher = CryptoHasher::new();
             hasher.update(&data.vec()[0].bytes());

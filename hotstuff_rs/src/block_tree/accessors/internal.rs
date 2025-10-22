@@ -821,11 +821,11 @@ impl<W: WriteBatch> BlockTreeWriteBatch<W> {
                     source: err,
                 })?,
         );
+        let data_len_value = block.data.len();
+        
         self.0.set(
             &concat(&block_prefix, &variables::BLOCK_DATA_LEN),
-            &block
-                .data
-                .len()
+            &data_len_value
                 .try_to_vec()
                 .map_err(|err| KVSetError::SerializeValueError {
                     key: Key::BlockDataLength {
