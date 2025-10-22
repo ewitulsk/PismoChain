@@ -28,6 +28,7 @@ use pismo_app_jmt::PismoAppJMT;
 use pismo_app_jmt::PismoTransaction;
 use config::load_config;
  
+use tracing::error;
 
 use validator_keys::{load_validator_keys, save_validator_keys, generate_validator_keypair};
 
@@ -47,7 +48,7 @@ use tokio::signal;
 
 
 use crate::{
-    database::rocks_db::RocksDBStore, events::{get_events_range, get_transactions_range, store_events, store_transaction, CommittedEvents, Event}, jmt_state::{make_key_hash_from_parts, DirectJMTReader, LATEST_VERSION_KEY}, networking::{create_libp2p_keypair_from_validator, load_network_config, LibP2PNetwork, MockNetwork, NetworkRuntimeConfig}, pismo_app_jmt::BlockPayload, standards::book_executor::BookExecutor
+    database::rocks_db::RocksDBStore, events::{get_events_range, get_transactions_range, store_events, store_transaction, CommittedEvents, Event}, jmt_state::{make_key_hash_from_parts, DirectJMTReader}, networking::{create_libp2p_keypair_from_validator, load_network_config, LibP2PNetwork, MockNetwork, NetworkRuntimeConfig}, pismo_app_jmt::BlockPayload, standards::book_executor::BookExecutor
 };
 use jmt::JellyfishMerkleTree;
 use hotstuff_rs::block_tree::accessors::public::BlockTreeCamera;
@@ -84,13 +85,13 @@ fn build_validator_set_from_network_config(
 fn handle_commit_block(
     event: &hotstuff_rs::events::CommitBlockEvent,
     kv_store: &RocksDBStore,
-    is_listener: bool,
+    _is_listener: bool,
     event_broadcast_tx: Option<&tokio::sync::broadcast::Sender<crate::events::CommittedEvents>>,
 ) { 
     let block_tree_camera = BlockTreeCamera::new(kv_store.clone());
     let snapshot = block_tree_camera.snapshot();
     
-    if let Ok(Some(block)) = snapshot.block(&event.block) {
+    if snapshot.block(&event.block).is_ok() {
         let block_data = match snapshot.block_data(&event.block) {
             Ok(Some(data)) => {
                 data
@@ -98,7 +99,7 @@ fn handle_commit_block(
             Ok(None) => {
                 return;
             }
-            Err(e) => {
+            Err(_) => {
                 return;
             }
         };
@@ -111,13 +112,16 @@ fn handle_commit_block(
                 for (i, tx) in block_payload.transactions.iter().enumerate() {
                     let tx_version = start_version + i as u64;
                     if let Err(e) = store_transaction(kv_store, tx_version, tx) {
-                        eprintln!("❌ Failed to store transaction at version {}: {}", tx_version, e);
+                        error!("❌ Failed to store transaction at version {}: {}", tx_version, e);
                     }
                 }
                 
                 if !block_payload.events.is_empty() {
-                    if let Err(e) = store_events(kv_store, block_payload.final_version, block_payload.events.clone()) {
-                        eprintln!("❌ Failed to store events for version {}: {}", block_payload.final_version, e);
+                    match store_events(kv_store, block_payload.final_version, block_payload.events.clone()) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            error!("❌ Failed to store events for version {}: {}", block_payload.final_version, e);
+                        }
                     }
                     
                     if let Some(sender) = event_broadcast_tx {
@@ -132,6 +136,7 @@ fn handle_commit_block(
                                 }
                             }).collect(),
                         };
+
                         let _ = sender.send(committed);
                     }
                 }

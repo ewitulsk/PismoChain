@@ -1,0 +1,1 @@
+PISMO_NETWORK=libp2p PISMO_NODE_ROLE=validator PISMO_INIT_STORAGE=true PISMO_NETWORK_CONFIG=config/network.toml VALIDATOR_KEYS_PATH=validator.keys PISMO_DB_PATH=data/pismo_db PISMO_RPC_PORT=9944 cargo run -- --nocapture
