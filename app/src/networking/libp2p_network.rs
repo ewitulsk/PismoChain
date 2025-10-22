@@ -538,22 +538,6 @@ impl LibP2PNetwork {
         self.local_peer_id
     }
 
-    /// Enable event streaming (for listener nodes)
-    /// This adds an event stream behaviour to the network for serving event subscriptions
-    pub fn enable_event_streaming(
-        &mut self,
-        kv_store: crate::database::rocks_db::RocksDBStore,
-        event_receiver: UnboundedReceiver<crate::events::CommittedEvents>,
-    ) -> Result<()> {
-        let command = NetworkCommand::EnableEventStreaming {
-            kv_store,
-            event_receiver,
-        };
-        self.command_sender.send(command)
-            .map_err(|e| anyhow!("Failed to send enable event streaming command: {}", e))?;
-        Ok(())
-    }
-
     /// Get connection statistics
     pub fn connection_stats(&self) -> HashMap<String, usize> {
         // This would need to be implemented by querying the behaviour
