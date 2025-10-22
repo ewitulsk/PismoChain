@@ -52,11 +52,19 @@ impl EventStreamService {
         use hotstuff_rs::block_tree::pluggables::KVGet;
         use crate::jmt_state::LATEST_VERSION_KEY;
         
-        if let Some(version_bytes) = self.kv_store.get(LATEST_VERSION_KEY) {
+        // HotStuff stores committed app state with a prefix byte (3)
+        const COMMITTED_APP_STATE: u8 = 3;
+        let mut key = Vec::new();
+        key.push(COMMITTED_APP_STATE);
+        key.extend_from_slice(LATEST_VERSION_KEY);
+        
+        if let Some(version_bytes) = self.kv_store.get(&key) {
             if version_bytes.len() >= 8 {
-                return u64::from_le_bytes(version_bytes[..8].try_into().unwrap_or([0u8; 8]));
+                let version = u64::from_le_bytes(version_bytes[..8].try_into().unwrap_or([0u8; 8]));
+                return version;
             }
         }
+        warn!("⚠️ Could not read current version from storage, defaulting to 0");
         0
     }
 }
@@ -90,7 +98,13 @@ impl EventStream for EventStreamService {
                 use hotstuff_rs::block_tree::pluggables::KVGet;
                 use crate::jmt_state::LATEST_VERSION_KEY;
                 
-                if let Some(version_bytes) = kv.get(LATEST_VERSION_KEY) {
+                // HotStuff stores committed app state with a prefix byte (3)
+                const COMMITTED_APP_STATE: u8 = 3;
+                let mut key = Vec::new();
+                key.push(COMMITTED_APP_STATE);
+                key.extend_from_slice(LATEST_VERSION_KEY);
+                
+                if let Some(version_bytes) = kv.get(&key) {
                     if version_bytes.len() >= 8 {
                         return u64::from_le_bytes(version_bytes[..8].try_into().unwrap_or([0u8; 8]));
                     }
@@ -133,7 +147,7 @@ impl EventStream for EventStreamService {
                             }
                         }
                         Err(e) => {
-                            error!("Error fetching historic events: {}", e);
+                            error!("❌ Error fetching historic events: {}", e);
                             yield Err(Status::internal(format!("Failed to fetch events: {}", e)));
                             return;
                         }
@@ -148,7 +162,6 @@ impl EventStream for EventStreamService {
                     }
                 }
                 
-                info!("Historic events complete, switching to live stream");
             }
 
             // Phase 2: Live events

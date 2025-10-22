@@ -60,16 +60,21 @@ fn make_transaction_key(version: u64) -> Vec<u8> {
 
 /// Store events for a specific version
 pub fn store_events(kv_store: &RocksDBStore, version: u64, events: Vec<(String, Vec<u8>)>) -> anyhow::Result<()> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    
     for (event_index, (event_type, event_data)) in events.into_iter().enumerate() {
         let event = Event {
             version,
             event_index: event_index as u32,
-            event_type,
-            event_data,
+            event_type: event_type.clone(),
+            event_data: event_data.clone(),
         };
         
         let key = make_event_key(version, event_index as u32);
         let value = event.try_to_vec()?;
+
         kv_store.write_cf(CF_EVENTS, &key, &value)?;
     }
     Ok(())
@@ -92,7 +97,7 @@ pub fn get_events_range(kv_store: &RocksDBStore, start_version: u64, end_version
     let raw_events = kv_store.scan_range_cf(CF_EVENTS, &start_key, &end_key)?;
     
     let mut events = Vec::new();
-    for (_key, value) in raw_events {
+    for (key, value) in raw_events {
         let event = Event::try_from_slice(&value)?;
         events.push(event);
     }
