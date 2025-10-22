@@ -310,12 +310,6 @@ impl<K: KVStore> App<K> for PismoAppJMT {
         request: ValidateBlockRequest<K>,
     ) -> ValidateBlockResponse {
         let data = &request.proposed_block().data;
-        
-        println!("🔍 validate_block: Received block with {} datums", data.vec().len());
-        if !data.vec().is_empty() {
-            println!("   First datum size: {} bytes", data.vec()[0].bytes().len());
-        }
-        
         let data_hash: CryptoHash = {
             let mut hasher = CryptoHasher::new();
             hasher.update(&data.vec()[0].bytes());
