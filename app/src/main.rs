@@ -176,7 +176,6 @@ async fn main() {
     println!("   PISMO_NETWORK=libp2p      - Enable distributed networking (current: {})", 
         if use_libp2p { "libp2p" } else { "mock" });
     println!("   PISMO_NODE_ROLE=listener  - Run as listener (read-only, no consensus) (current: {})", node_role);
-    println!("   PISMO_INIT_STORAGE=true   - Initialize/reinitialize storage");
     println!("   PISMO_NETWORK_CONFIG=path - Network config file (current: {})", 
         network_config_path);
     println!("   VALIDATOR_KEYS_PATH=path  - Validator keys file (current: {})", 
@@ -353,22 +352,6 @@ async fn main() {
         );
     }
 
-    // Storage initialization is controlled by PISMO_INIT_STORAGE environment variable
-    // This allows operators to explicitly control when to initialize or reinitialize storage
-    // 
-    // Usage scenarios:
-    // - First time setup (validator or listener): PISMO_INIT_STORAGE=true
-    // - Join existing network: PISMO_INIT_STORAGE=false (use existing storage)  
-    // - Reset node: PISMO_INIT_STORAGE=true (reinitialize with network config)
-    //
-    // Note: Both validators and listeners need initialized storage with genesis state.
-    // Listeners automatically don't participate in consensus because they're not in the validator set.
-    
-    // Check if initialization is needed via environment variable
-    let needs_initialization = std::env::var("PISMO_INIT_STORAGE")
-        .unwrap_or_else(|_| "false".to_string())
-        .to_lowercase() == "true";
-
     // Check if storage is empty (no committed validator set)
     let storage_is_empty = {
         let block_tree_camera = BlockTreeCamera::new(kv_store.clone());
@@ -376,15 +359,11 @@ async fn main() {
         snapshot.committed_validator_set().is_err()
     };
 
-    // Force initialization if storage is empty, even if PISMO_INIT_STORAGE=false
-    let should_initialize = needs_initialization || storage_is_empty;
+    // Auto-initialize if storage is empty
+    let should_initialize = storage_is_empty;
 
     if should_initialize {
-        if storage_is_empty {
-            println!("🔧 Empty storage detected - initializing with genesis state...");
-        } else {
-            println!("🔧 Storage initialization requested via PISMO_INIT_STORAGE=true");
-        }
+        println!("🔧 Empty storage detected - initializing with genesis state...");
         
         let init_app_state = PismoAppJMT::initial_app_state();
         Replica::initialize(kv_store.clone(), init_app_state, init_vs_state);
@@ -396,7 +375,7 @@ async fn main() {
             println!("✅ Validator storage initialized with {} validators", network_validator_set.len());
         }
     } else {
-        println!("📂 Using existing storage (set PISMO_INIT_STORAGE=true to reinitialize)");
+        println!("📂 Using existing storage");
         
         // Optionally warn if we can read the stored validator set and it differs
         let block_tree_camera = BlockTreeCamera::new(kv_store.clone());
@@ -405,7 +384,7 @@ async fn main() {
             Ok(stored_vs) if stored_vs.len() != network_validator_set.len() => {
                 println!("⚠️  WARNING: Stored validator set has {} validators, but network config has {}",
                     stored_vs.len(), network_validator_set.len());
-                println!("   Run with PISMO_INIT_STORAGE=true to reinitialize with network config");
+                println!("   Consider deleting the database directory to reinitialize with network config");
             }
             _ => {}
         }

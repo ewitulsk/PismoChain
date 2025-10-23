@@ -338,20 +338,32 @@ impl<K: KVStore> App<K> for PismoAppJMT {
             }
 
             // Validate all transactions in the block (signature, chain id, nonce)
+            // Skip invalid transactions instead of rejecting the entire block
+            let mut valid_transactions = Vec::new();
             for transaction in &block_payload.transactions {
                 if !transaction.is_signed() {
-                    println!("❌ Transaction validation failed: Transaction not signed");
-                    return ValidateBlockResponse::Invalid;
+                    tracing::warn!(
+                        public_key = %transaction.public_key,
+                        "Skipping transaction: not signed"
+                    );
+                    continue;
                 }
                 match transaction.verify_with_state(self.config.chain_id, &initial_block_tree, block_start_version) {
-                    Ok(true) => {}
+                    Ok(true) => {
+                        valid_transactions.push(transaction.clone());
+                    }
                     Ok(false) => {
-                        println!("❌ Transaction validation failed: signature/chain/nonce check failed for public_key {}", transaction.public_key);
-                        return ValidateBlockResponse::Invalid;
+                        tracing::warn!(
+                            public_key = %transaction.public_key,
+                            "Skipping transaction: signature/chain/nonce check failed"
+                        );
                     }
                     Err(e) => {
-                        println!("❌ Transaction validation failed: Verification error: {}", e);
-                        return ValidateBlockResponse::Invalid;
+                        tracing::warn!(
+                            public_key = %transaction.public_key,
+                            error = %e,
+                            "Skipping transaction: verification error"
+                        );
                     }
                 }
             }
@@ -374,8 +386,8 @@ impl<K: KVStore> App<K> for PismoAppJMT {
                 };
             }
 
-            // Execute transactions with JMT and verify state root
-            let (app_state_updates, computed_state_root, _final_version, _events) = self.execute(&block_payload.transactions, &initial_block_tree, block_start_version);
+            // Execute valid transactions with JMT and verify state root
+            let (app_state_updates, computed_state_root, _final_version, _events) = self.execute(&valid_transactions, &initial_block_tree, block_start_version);
             
             // Verify that the computed state root matches the proposed one
             let expected_state_root = block_payload.state_root();
