@@ -1,1 +1,1 @@
-PISMO_NETWORK=libp2p PISMO_NODE_ROLE=listener PISMO_INIT_STORAGE=true PISMO_NETWORK_CONFIG=config/listener_1.toml VALIDATOR_KEYS_PATH=validator3.keys PISMO_DB_PATH=data/pismo_db_3 PISMO_RPC_PORT=9946 cargo run --bin pismochain -- --nocapture
+PISMO_NETWORK=libp2p PISMO_NODE_ROLE=listener PISMO_NETWORK_CONFIG=config/listener_1.toml VALIDATOR_KEYS_PATH=validator3.keys PISMO_DB_PATH=data/pismo_db_3 PISMO_RPC_PORT=9946 cargo run --bin pismochain -- --nocapture
