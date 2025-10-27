@@ -1,9 +1,7 @@
 use jmt::{KeyHash, OwnedValue};
 
 use crate::jmt_state::{make_key_hash_from_parts, StateReader};
-use crate::standards::accounts::{
-    get_account_from_signer_state, make_account_object_key,
-};
+use crate::standards::accounts::get_account_from_signer_state;
 use crate::standards::book_executor::BookExecutor;
 use crate::standards::orderbook::{
     Order, Orderbook, derive_orderbook_addr, 
@@ -27,16 +25,10 @@ pub fn build_create_orderbook_updates(
     let mut mirror: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let events: Vec<(String, Vec<u8>)> = Vec::new();
 
-    // Increment the account nonce
-    if let Some(mut account) = get_account_from_signer_state(state, &signer_address.to_string(), signer_type, signature_type, &signing_pub_key) {
-        let account_addr = account.account_addr;
-        account.increment_nonce();
-        
-        // Serialize the updated account
-        let account_bytes = <crate::standards::accounts::Account as borsh::BorshSerialize>::try_to_vec(&account).unwrap();
-        let account_jmt_key = make_key_hash_from_parts(account_addr, b"acct");
-        jmt_writes.push((account_jmt_key, Some(account_bytes.clone())));
-        mirror.push((make_account_object_key(&account_addr), account_bytes));
+    // Verify account exists
+    if get_account_from_signer_state(state, &signer_address.to_string(), signer_type, signature_type, &signing_pub_key).is_none() {
+        println!("❌ Account does not exist");
+        return (false, (vec![], vec![], vec![]));
     }
 
     // Convert hex strings to byte arrays
@@ -124,14 +116,13 @@ pub fn build_new_limit_order_updates(
     let events: Vec<(String, Vec<u8>)> = Vec::new();
 
     // Check if orderbook exists and account exists
-    if let (Some(mut orderbook), Some(mut account)) = (
+    if let (Some(mut orderbook), Some(account)) = (
         get_orderbook_from_state(state, &orderbook_address),
         get_account_from_signer_state(state, &signer_address.to_string(), signer_type, signature_type, &signing_pub_key)
     ) {
-        account.increment_nonce();
         let account_addr = account.account_addr;
         
-        // Generate a unique order ID using the current nonce (before incrementing)
+        // Generate a unique order ID using the current nonce
         let order_id = generate_order_id(&account_addr, account.current_nonce, amount, is_buy);
         
         // Create the order
@@ -153,12 +144,6 @@ pub fn build_new_limit_order_updates(
         let orderbook_jmt_key = make_key_hash_from_parts(orderbook_address, b"orderbook");
         jmt_writes.push((orderbook_jmt_key, Some(orderbook_bytes.clone())));
         mirror.push((make_orderbook_object_key(&orderbook_address), orderbook_bytes));
-
-        // Serialize the updated account
-        let account_bytes = <crate::standards::accounts::Account as borsh::BorshSerialize>::try_to_vec(&account).unwrap();
-        let account_jmt_key = make_key_hash_from_parts(account_addr, b"acct");
-        jmt_writes.push((account_jmt_key, Some(account_bytes.clone())));
-        mirror.push((make_account_object_key(&account_addr), account_bytes));
 
         println!("✅ Added {} order (ID: {}) for {} at tick {} to orderbook: {:?}", 
             if is_buy { "BUY" } else { "SELL"}, 

@@ -200,9 +200,13 @@ impl Transaction<PismoOperation> {
                     false
                 }
             }
-            // For onramp, enforce nonce == 0 for now (no account context)
+            // For onramp, check nonce matches current account nonce
             PismoOperation::Onramp(_, _) => {
-                self.nonce == 0
+                if let Some(account) = get_account_from_signer(block_tree, &self.signer, self.signer_type, self.signature_type, &self.public_key) {
+                    self.nonce == account.current_nonce
+                } else {
+                    false
+                }
             }
             // For NoOp, the account must exist and tx.nonce must equal current_nonce
             PismoOperation::NoOp => {
@@ -238,9 +242,13 @@ impl Transaction<PismoOperation> {
                     false
                 }
             }
-            // For Offramp, enforce nonce == 0 for now (no nonce increment)
+            // For Offramp, check nonce matches current account nonce
             PismoOperation::Offramp { .. } => {
-                self.nonce == 0
+                if let Some(account) = get_account_from_signer(block_tree, &self.signer, self.signer_type, self.signature_type, &self.public_key) {
+                    self.nonce == account.current_nonce
+                } else {
+                    false
+                }
             }
             // For CreateOrderbook, the account must exist and tx.nonce must equal current_nonce
             PismoOperation::CreateOrderbook { .. } => {

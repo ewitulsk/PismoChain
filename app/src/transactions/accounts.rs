@@ -1,12 +1,10 @@
 use std::collections::BTreeMap;
 
-use hotstuff_rs::block_tree::accessors::app::AppBlockTreeView;
-use hotstuff_rs::block_tree::pluggables::KVStore;
 use jmt::{KeyHash, OwnedValue};
 
 use crate::jmt_state::{make_key_hash_from_parts, StateReader};
 use crate::standards::accounts::{
-    Account, AccountMeta, ExternalLink, Policy, ScopeBits,
+    Account, AccountMeta, ExternalLink,
     default_algo_for_signature_type, derive_account_addr, make_account_object_key, make_link_object_key,
     get_account_from_signer_state, make_link_jmt_key_hash,
 };
@@ -17,8 +15,6 @@ use crate::transactions::{SignerType, SignatureType};
 pub fn build_create_account_updates(
     signature_type: SignatureType,
     signing_pub_key: String,
-    _signer_type: SignerType,
-    _state: &impl StateReader
 ) -> (bool, (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>, Vec<(String, Vec<u8>)>)) {
     let account_addr = derive_account_addr(1, signature_type, &signing_pub_key);
     let account_addr_hex = hex::encode(account_addr);
@@ -62,8 +58,37 @@ pub fn build_create_account_updates(
     (true, (jmt_writes, mirror, events))
 }
 
+/// Build writes and app-mirror inserts for incrementing account nonce
+/// This should be called after every successful transaction execution
+/// Returns (success, (jmt_writes, mirror_inserts))
+pub fn build_account_nonce_updates(
+    signing_pub_key: String,
+    signer_address: &str,
+    signer_type: SignerType,
+    signature_type: SignatureType,
+    state: &impl StateReader
+) -> (bool, (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>)) {
+    let mut jmt_writes: Vec<(KeyHash, Option<OwnedValue>)> = Vec::new();
+    let mut mirror: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+
+    if let Some(mut account) = get_account_from_signer_state(state, &signer_address.to_string(), signer_type, signature_type, &signing_pub_key) {
+        let account_addr = account.account_addr;
+        account.increment_nonce();
+        
+        // Serialize the updated account
+        let account_bytes = <Account as borsh::BorshSerialize>::try_to_vec(&account).unwrap();
+        let jmt_key = make_key_hash_from_parts(account_addr, b"acct");
+        jmt_writes.push((jmt_key, Some(account_bytes.clone())));
+        mirror.push((make_account_object_key(&account_addr), account_bytes));
+        
+        (true, (jmt_writes, mirror))
+    } else {
+        (false, (jmt_writes, mirror))
+    }
+}
+
 /// Build writes and app-mirror inserts for linking a new external address
-/// This function handles all the logic including nonce increment
+/// This function handles all the logic for linking accounts (nonce increment handled separately)
 /// Returns (success, (jmt_writes, mirror_inserts, events))
 pub fn build_link_account_updates(
     signing_pub_key: String,
@@ -79,7 +104,6 @@ pub fn build_link_account_updates(
 
     if let Some(mut account) = get_account_from_signer_state(state, &signer_address.to_string(), signer_type, signature_type, &signing_pub_key) {
         let account_addr = account.account_addr;
-        account.increment_nonce();
         
         // Add the new external link
         let link = ExternalLink {
@@ -89,7 +113,7 @@ pub fn build_link_account_updates(
         };
         account.links.insert(link.clone());
         
-        // Serialize the updated account
+        // Serialize the updated account (without nonce increment)
         let account_bytes = <Account as borsh::BorshSerialize>::try_to_vec(&account).unwrap();
         let jmt_key = make_key_hash_from_parts(account_addr, b"acct");
         jmt_writes.push((jmt_key, Some(account_bytes.clone())));

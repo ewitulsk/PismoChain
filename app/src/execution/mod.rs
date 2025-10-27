@@ -14,7 +14,7 @@ use crate::{
     pismo_app_jmt::{PismoOperation, PismoTransaction},
     standards::book_executor::BookExecutor,
     transactions::{
-        accounts::{build_create_account_updates, build_link_account_updates},
+        accounts::{build_create_account_updates, build_link_account_updates, build_account_nonce_updates},
         noop::build_noop_updates,
         coin::{build_new_coin_updates, build_mint_updates, build_transfer_updates},
         orderbook::{build_create_orderbook_updates, build_new_limit_order_updates},
@@ -94,14 +94,25 @@ pub fn execute_transaction<K: KVStore>(
             pending_state.apply_jmt_writes(writes);
             pending_state.apply_mirror_inserts(mirrors);
             pending_state.apply_events(events);
+            
+            // Increment account nonce
+            let (nonce_success, (nonce_writes, nonce_mirrors)) = build_account_nonce_updates(
+                signing_pub_key.clone(),
+                signer_address,
+                signer_type,
+                signature_type,
+                pending_state
+            );
+            if nonce_success {
+                pending_state.apply_jmt_writes(nonce_writes);
+                pending_state.apply_mirror_inserts(nonce_mirrors);
+            }
         }
         
         PismoOperation::CreateAccount => {
             let (success, (writes, mirrors, events)) = build_create_account_updates(
                 signature_type, 
-                signing_pub_key, 
-                signer_type, 
-                pending_state
+                signing_pub_key,
             );
             if !success {
                 return false;
@@ -113,7 +124,7 @@ pub fn execute_transaction<K: KVStore>(
         
         PismoOperation::LinkAccount { external_wallet } => {
             let (success, (writes, mirrors, events)) = build_link_account_updates(
-                signing_pub_key, 
+                signing_pub_key.clone(), 
                 external_wallet, 
                 signature_type, 
                 signer_address, 
@@ -126,11 +137,24 @@ pub fn execute_transaction<K: KVStore>(
             pending_state.apply_jmt_writes(writes);
             pending_state.apply_mirror_inserts(mirrors);
             pending_state.apply_events(events);
+            
+            // Increment account nonce
+            let (nonce_success, (nonce_writes, nonce_mirrors)) = build_account_nonce_updates(
+                signing_pub_key.clone(),
+                signer_address,
+                signer_type,
+                signature_type,
+                pending_state
+            );
+            if nonce_success {
+                pending_state.apply_jmt_writes(nonce_writes);
+                pending_state.apply_mirror_inserts(nonce_mirrors);
+            }
         }
         
         PismoOperation::NoOp => {
             let (success, (writes, mirrors, events)) = build_noop_updates(
-                signing_pub_key, 
+                signing_pub_key.clone(), 
                 signer_address, 
                 signer_type, 
                 signature_type, 
@@ -142,6 +166,19 @@ pub fn execute_transaction<K: KVStore>(
             pending_state.apply_jmt_writes(writes);
             pending_state.apply_mirror_inserts(mirrors);
             pending_state.apply_events(events);
+            
+            // Increment account nonce
+            let (nonce_success, (nonce_writes, nonce_mirrors)) = build_account_nonce_updates(
+                signing_pub_key.clone(),
+                signer_address,
+                signer_type,
+                signature_type,
+                pending_state
+            );
+            if nonce_success {
+                pending_state.apply_jmt_writes(nonce_writes);
+                pending_state.apply_mirror_inserts(nonce_mirrors);
+            }
         }
         
         PismoOperation::NewCoin { 
@@ -159,11 +196,8 @@ pub fn execute_transaction<K: KVStore>(
                 *total_supply,
                 *max_supply,
                 *canonical_chain_id,
-                signing_pub_key,
-                signer_address,
-                signer_type,
+                signing_pub_key.clone(),
                 signature_type,
-                pending_state
             );
             if !success {
                 return false;
@@ -171,6 +205,19 @@ pub fn execute_transaction<K: KVStore>(
             pending_state.apply_jmt_writes(writes);
             pending_state.apply_mirror_inserts(mirrors);
             pending_state.apply_events(events);
+            
+            // Increment account nonce
+            let (nonce_success, (nonce_writes, nonce_mirrors)) = build_account_nonce_updates(
+                signing_pub_key.clone(),
+                signer_address,
+                signer_type,
+                signature_type,
+                pending_state
+            );
+            if nonce_success {
+                pending_state.apply_jmt_writes(nonce_writes);
+                pending_state.apply_mirror_inserts(nonce_mirrors);
+            }
         }
         
         PismoOperation::Mint { coin_addr, account_addr, amount } => {
@@ -178,7 +225,7 @@ pub fn execute_transaction<K: KVStore>(
                 *coin_addr,
                 *account_addr,
                 *amount,
-                signing_pub_key,
+                signing_pub_key.clone(),
                 signer_address,
                 signer_type,
                 signature_type,
@@ -190,6 +237,19 @@ pub fn execute_transaction<K: KVStore>(
             pending_state.apply_jmt_writes(writes);
             pending_state.apply_mirror_inserts(mirrors);
             pending_state.apply_events(events);
+            
+            // Increment account nonce
+            let (nonce_success, (nonce_writes, nonce_mirrors)) = build_account_nonce_updates(
+                signing_pub_key.clone(),
+                signer_address,
+                signer_type,
+                signature_type,
+                pending_state
+            );
+            if nonce_success {
+                pending_state.apply_jmt_writes(nonce_writes);
+                pending_state.apply_mirror_inserts(nonce_mirrors);
+            }
         }
         
         PismoOperation::Transfer { coin_addr, receiver_addr, amount } => {
@@ -197,7 +257,7 @@ pub fn execute_transaction<K: KVStore>(
                 *coin_addr,
                 *receiver_addr,
                 *amount,
-                signing_pub_key,
+                signing_pub_key.clone(),
                 signer_address,
                 signer_type,
                 signature_type,
@@ -209,6 +269,19 @@ pub fn execute_transaction<K: KVStore>(
             pending_state.apply_jmt_writes(writes);
             pending_state.apply_mirror_inserts(mirrors);
             pending_state.apply_events(events);
+            
+            // Increment account nonce
+            let (nonce_success, (nonce_writes, nonce_mirrors)) = build_account_nonce_updates(
+                signing_pub_key.clone(),
+                signer_address,
+                signer_type,
+                signature_type,
+                pending_state
+            );
+            if nonce_success {
+                pending_state.apply_jmt_writes(nonce_writes);
+                pending_state.apply_mirror_inserts(nonce_mirrors);
+            }
         }
         
         PismoOperation::Offramp { amount, coin_address, recipient_address, destination_chain } => {
@@ -217,7 +290,7 @@ pub fn execute_transaction<K: KVStore>(
                 *coin_address,
                 *recipient_address,
                 *destination_chain,
-                signing_pub_key,
+                signing_pub_key.clone(),
                 signer_address,
                 signer_type,
                 signature_type,
@@ -229,13 +302,26 @@ pub fn execute_transaction<K: KVStore>(
             pending_state.apply_jmt_writes(writes);
             pending_state.apply_mirror_inserts(mirrors);
             pending_state.apply_events(events);
+            
+            // Increment account nonce
+            let (nonce_success, (nonce_writes, nonce_mirrors)) = build_account_nonce_updates(
+                signing_pub_key.clone(),
+                signer_address,
+                signer_type,
+                signature_type,
+                pending_state
+            );
+            if nonce_success {
+                pending_state.apply_jmt_writes(nonce_writes);
+                pending_state.apply_mirror_inserts(nonce_mirrors);
+            }
         }
         
         PismoOperation::CreateOrderbook { buy_asset, sell_asset } => {
             let (success, (writes, mirrors, events)) = build_create_orderbook_updates(
                 buy_asset.clone(),
                 sell_asset.clone(),
-                signing_pub_key,
+                signing_pub_key.clone(),
                 signer_address,
                 signer_type,
                 signature_type,
@@ -248,6 +334,19 @@ pub fn execute_transaction<K: KVStore>(
             pending_state.apply_jmt_writes(writes);
             pending_state.apply_mirror_inserts(mirrors);
             pending_state.apply_events(events);
+            
+            // Increment account nonce
+            let (nonce_success, (nonce_writes, nonce_mirrors)) = build_account_nonce_updates(
+                signing_pub_key.clone(),
+                signer_address,
+                signer_type,
+                signature_type,
+                pending_state
+            );
+            if nonce_success {
+                pending_state.apply_jmt_writes(nonce_writes);
+                pending_state.apply_mirror_inserts(nonce_mirrors);
+            }
         }
         
         PismoOperation::NewLimitOrder { 
@@ -261,7 +360,7 @@ pub fn execute_transaction<K: KVStore>(
                 *is_buy,
                 *amount,
                 *tick_price,
-                signing_pub_key,
+                signing_pub_key.clone(),
                 signer_address,
                 signer_type,
                 signature_type,
@@ -274,6 +373,19 @@ pub fn execute_transaction<K: KVStore>(
             pending_state.apply_jmt_writes(writes);
             pending_state.apply_mirror_inserts(mirrors);
             pending_state.apply_events(events);
+            
+            // Increment account nonce
+            let (nonce_success, (nonce_writes, nonce_mirrors)) = build_account_nonce_updates(
+                signing_pub_key.clone(),
+                signer_address,
+                signer_type,
+                signature_type,
+                pending_state
+            );
+            if nonce_success {
+                pending_state.apply_jmt_writes(nonce_writes);
+                pending_state.apply_mirror_inserts(nonce_mirrors);
+            }
         }
     }
 

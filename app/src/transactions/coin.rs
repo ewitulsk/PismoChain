@@ -4,7 +4,7 @@ use borsh::BorshSerialize;
 
 use crate::jmt_state::{make_key_hash_from_parts, StateReader};
 use crate::standards::accounts::{
-    get_account_from_signer_state, make_account_object_key, derive_account_addr,
+    get_account_from_signer_state, derive_account_addr,
 };
 use crate::standards::coin::{
     Coin, CoinStore, derive_coin_addr, make_coin_object_key,
@@ -24,10 +24,7 @@ pub fn build_new_coin_updates(
     max_supply: Option<u128>,
     canonical_chain_id: u64,
     signing_pub_key: String,
-    signer_address: &str,
-    signer_type: SignerType,
     signature_type: SignatureType,
-    state: &impl StateReader
 ) -> (bool, (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>, Vec<(String, Vec<u8>)>)) {
     let mut jmt_writes: Vec<(KeyHash, Option<OwnedValue>)> = Vec::new();
     let mut mirror: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -60,22 +57,7 @@ pub fn build_new_coin_updates(
     let coin_object_key = make_coin_object_key(&coin_addr);
     mirror.push((coin_object_key, coin_bytes));
 
-    // If we have an existing account, increment its nonce
-    if let Some(mut account) = get_account_from_signer_state(state, &signer_address.to_string(), signer_type, signature_type, &signing_pub_key) {
-        let account_addr = account.account_addr;
-        account.increment_nonce();
-        
-        // Serialize the updated account
-        let account_bytes = <crate::standards::accounts::Account as borsh::BorshSerialize>::try_to_vec(&account).unwrap();
-        let account_jmt_key = make_key_hash_from_parts(account_addr, b"acct");
-        jmt_writes.push((account_jmt_key, Some(account_bytes.clone())));
-        mirror.push((make_account_object_key(&account_addr), account_bytes));
-        
-        (true, (jmt_writes, mirror, events))
-    } else {
-        // Account not found - this is a failure case, but we still create the coin
-        (true, (jmt_writes, mirror, events))
-    }
+    (true, (jmt_writes, mirror, events))
 }
 
 /// Build writes and app-mirror inserts for minting tokens
@@ -95,14 +77,10 @@ pub fn build_mint_updates(
     let mut events: Vec<(String, Vec<u8>)> = Vec::new();
 
     // Check both coin and account existence at the start
-    if let (Some(mut coin), Some(mut account)) = (
+    if let (Some(mut coin), Some(_account)) = (
         get_coin_from_state(state, &coin_addr),
         get_account_from_signer_state(state, &signer_address.to_string(), signer_type, signature_type, &signing_pub_key)
     ) {
-        // Increment the account nonce
-        let account_addr_local = account.account_addr;
-        account.increment_nonce();
-        
         // Both coin and account exist, proceed with minting
         
         // Update the coin's total supply
@@ -151,12 +129,6 @@ pub fn build_mint_updates(
         };
         events.push(("Transfer".to_string(), transfer_event.try_to_vec().unwrap()));
         
-        // Serialize the updated account
-        let account_bytes = <crate::standards::accounts::Account as borsh::BorshSerialize>::try_to_vec(&account).unwrap();
-        let account_jmt_key = make_key_hash_from_parts(account_addr_local, b"acct");
-        jmt_writes.push((account_jmt_key, Some(account_bytes.clone())));
-        mirror.push((make_account_object_key(&account_addr_local), account_bytes));
-        
         (true, (jmt_writes, mirror, events))
     } else {
         // If either coin or account doesn't exist, this is a failure
@@ -182,15 +154,12 @@ pub fn build_transfer_updates(
     let mut events: Vec<(String, Vec<u8>)> = Vec::new();
 
     // Check both coin and sender account existence at the start
-    if let (Some(_coin), Some(mut sender_account)) = (
+    if let (Some(_coin), Some(sender_account)) = (
         get_coin_from_state(state, &coin_addr),
         get_account_from_signer_state(state, &signer_address.to_string(), signer_type, signature_type, &signing_pub_key)
     ) {
         // Derive sender's account address from their signing public key (CRITICAL SECURITY RULE)
         let sender_account_addr = sender_account.account_addr;
-        
-        // Increment the sender's account nonce
-        sender_account.increment_nonce();
         
         // Derive coin store addresses
         let sender_store_addr = derive_coin_store_addr(&sender_account_addr, &coin_addr);
@@ -233,12 +202,6 @@ pub fn build_transfer_updates(
                     amount,
                 };
                 
-                // Serialize and store the updated sender's account (with incremented nonce)
-                let account_bytes = <crate::standards::accounts::Account as borsh::BorshSerialize>::try_to_vec(&sender_account).unwrap();
-                let account_jmt_key = make_key_hash_from_parts(sender_account_addr, b"acct");
-                jmt_writes.push((account_jmt_key, Some(account_bytes.clone())));
-                mirror.push((make_account_object_key(&sender_account_addr), account_bytes));
-
                 events.push(("Transfer".to_string(), transfer_event.try_to_vec().unwrap()));
                 
                 println!("✅ Transfer successful: {} tokens from {:?} to {:?}", 
