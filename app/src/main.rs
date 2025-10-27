@@ -48,7 +48,7 @@ use tokio::signal;
 
 
 use crate::{
-    database::rocks_db::RocksDBStore, events::{get_events_range, get_transactions_range, store_events, store_transaction, CommittedEvents, Event}, jmt_state::{make_key_hash_from_parts, DirectJMTReader}, networking::{create_libp2p_keypair_from_validator, load_network_config, LibP2PNetwork, MockNetwork, NetworkRuntimeConfig}, pismo_app_jmt::BlockPayload, standards::book_executor::BookExecutor
+    database::rocks_db::RocksDBStore, events::{get_events_range, get_transactions_range, get_offramp_proof, store_events, store_transaction, CommittedEvents, Event}, jmt_state::{make_key_hash_from_parts, DirectJMTReader}, networking::{create_libp2p_keypair_from_validator, load_network_config, LibP2PNetwork, MockNetwork, NetworkRuntimeConfig}, pismo_app_jmt::BlockPayload, standards::book_executor::BookExecutor
 };
 use jmt::JellyfishMerkleTree;
 use hotstuff_rs::block_tree::accessors::public::BlockTreeCamera;
@@ -810,6 +810,28 @@ async fn main() {
         })
         .expect("register get_transactions method");
 
+    // Add method to get offramp proof
+    let kv_store_for_proof = kv_store_for_rpc.clone();
+    module
+        .register_method("get_offramp_proof", move |params, _mdata, _ctx| {
+            use jsonrpsee::types::ErrorObjectOwned;
+
+            // Parse parameters: [version, event_index]
+            let (version, event_index): (u64, u32) = params.parse()?;
+            
+            match get_offramp_proof(&kv_store_for_proof, version, event_index) {
+                Ok(proof_response) => {
+                    serde_json::to_value(&proof_response).map_err(|e| {
+                        ErrorObjectOwned::owned(-32001, "Failed to serialize proof response", Some(e.to_string()))
+                    })
+                }
+                Err(e) => {
+                    Err(ErrorObjectOwned::owned(-32001, "Failed to generate offramp proof", Some(e.to_string())))
+                }
+            }
+        })
+        .expect("register get_offramp_proof method");
+
     let server_handle = server.start(module);
     println!("🔌 JSON-RPC server listening on http://{}", server_addr);
     if is_listener {
@@ -817,12 +839,14 @@ async fn main() {
         println!("   - view (types: Account, Coin, CoinStore, Link, Orderbook) [READ-ONLY]");
         println!("   - get_events(start_version, end_version) [READ-ONLY]");
         println!("   - get_transactions(start_version, end_version) [READ-ONLY]");
+        println!("   - get_offramp_proof(version, event_index) [READ-ONLY]");
     } else {
         println!("   Methods:");
         println!("   - submit_borsh_tx");
         println!("   - view (types: Account, Coin, CoinStore, Link, Orderbook)");
         println!("   - get_events(start_version, end_version)");
         println!("   - get_transactions(start_version, end_version)");
+        println!("   - get_offramp_proof(version, event_index)");
     }
 
     // Keep the node alive using tokio::select! (exit on RPC stop or ctrl-c)

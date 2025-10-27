@@ -145,6 +145,22 @@ pub fn make_key_hash_from_parts(addr: [u8; 32], struct_tag: &[u8]) -> KeyHash {
     make_key_hash(state_key)
 }
 
+/// Create a deterministic address for an offramp event based on version and event index
+/// This ensures each offramp event has a unique, reproducible JMT key
+pub fn make_offramp_event_addr(version: u64, event_index: u32) -> [u8; 32] {
+    let mut hasher = <Sha3_256 as Digest>::new();
+    sha3::Digest::update(&mut hasher, b"offramp_event");
+    sha3::Digest::update(&mut hasher, version.to_le_bytes());
+    sha3::Digest::update(&mut hasher, event_index.to_le_bytes());
+    sha3::Digest::finalize(hasher).into()
+}
+
+/// Create a JMT KeyHash for an offramp event
+pub fn make_offramp_event_key_hash(version: u64, event_index: u32) -> KeyHash {
+    let addr = make_offramp_event_addr(version, event_index);
+    make_key_hash_from_parts(addr, b"offramp_event")
+}
+
 /// Key prefixes for storing JMT data in HotStuff's app state
 const JMT_NODE_PREFIX: &[u8] = b"__jmt_node__";
 const JMT_VALUE_PREFIX: &[u8] = b"__jmt_value__";
@@ -153,7 +169,8 @@ const JMT_ROOT_PREFIX: &[u8] = b"__jmt_root__";
 const JMT_LATEST_PREFIX: &[u8] = b"__jmt_latest__";
 /// Key for storing the latest JMT version
 pub const LATEST_VERSION_KEY: &[u8] = b"__jmt_latest_version__";
-const COMMITTED_APP_STATE: u8 = 3;
+/// Prefix byte for committed app state in KVStore
+pub const COMMITTED_APP_STATE: u8 = 3;
 
 /// Helper to create a latest-value index key for a given KeyHash
 fn make_latest_key(key_hash: KeyHash) -> Vec<u8> {

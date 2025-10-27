@@ -1,7 +1,7 @@
 use jmt::{KeyHash, OwnedValue};
 use borsh::BorshSerialize;
 
-use crate::jmt_state::{make_key_hash_from_parts, StateReader};
+use crate::jmt_state::{make_key_hash_from_parts, make_offramp_event_key_hash, StateReader};
 use crate::standards::accounts::get_account_from_signer_state;
 use crate::standards::coin::{
     Coin, CoinStore, derive_coin_store_addr, make_coin_object_key,
@@ -21,6 +21,8 @@ pub fn build_offramp_updates(
     signer_address: &str,
     signer_type: SignerType,
     signature_type: SignatureType,
+    version: u64,
+    event_index: u32,
     state: &impl StateReader
 ) -> (bool, (Vec<(KeyHash, Option<OwnedValue>)>, Vec<(Vec<u8>, Vec<u8>)>, Vec<(String, Vec<u8>)>)) {
     let mut jmt_writes: Vec<(KeyHash, Option<OwnedValue>)> = Vec::new();
@@ -97,12 +99,20 @@ pub fn build_offramp_updates(
         recipient_address: recipient_addr,
         destination_chain,
     };
-    events.push(("Offramp".to_string(), offramp_event.try_to_vec().unwrap()));
+    let offramp_event_bytes = offramp_event.try_to_vec().unwrap();
+    events.push(("Offramp".to_string(), offramp_event_bytes.clone()));
 
-    println!("✅ Offramp successful: {} tokens burned from {:?} for bridge to chain {}", 
+    // Step 12: Store the offramp event in JMT for inclusion proof generation
+    // This allows external chains to cryptographically verify the offramp transaction
+    let offramp_event_key_hash = make_offramp_event_key_hash(version, event_index);
+    jmt_writes.push((offramp_event_key_hash, Some(offramp_event_bytes)));
+
+    println!("✅ Offramp successful: {} tokens burned from {:?} for bridge to chain {} (version={}, event_index={})", 
         amount, 
         hex::encode(&sender_account_addr[..8]),
-        destination_chain);
+        destination_chain,
+        version,
+        event_index);
 
     (true, (jmt_writes, mirror, events))
 }

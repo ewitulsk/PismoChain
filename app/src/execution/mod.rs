@@ -285,6 +285,8 @@ pub fn execute_transaction<K: KVStore>(
         }
         
         PismoOperation::Offramp { amount, coin_address, recipient_address, destination_chain } => {
+            let event_index = pending_state.events.len() as u32;
+            
             let (success, (writes, mirrors, events)) = build_offramp_updates(
                 *amount,
                 *coin_address,
@@ -294,6 +296,8 @@ pub fn execute_transaction<K: KVStore>(
                 signer_address,
                 signer_type,
                 signature_type,
+                pending_state.version,
+                event_index,
                 pending_state
             );
             if !success {
