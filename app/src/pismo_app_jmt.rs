@@ -70,6 +70,13 @@ pub enum PismoOperation {
         receiver_addr: [u8; 32],
         amount: u128,
     },
+    /// Offramp tokens to another chain via bridge
+    Offramp {
+        amount: u64,
+        coin_address: [u8; 32],
+        recipient_address: [u8; 32],
+        destination_chain: u16,
+    },
     /// Create a new spot orderbook for a trading pair
     CreateOrderbook {
         buy_asset: String,

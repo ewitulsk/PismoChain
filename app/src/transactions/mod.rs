@@ -1,6 +1,7 @@
 //! Generic transaction system with cryptographic signing and verification using Sui SDK.
 
 pub mod onramp;
+pub mod offramp;
 pub mod accounts;
 pub mod noop;
 pub mod coin;
@@ -236,6 +237,10 @@ impl Transaction<PismoOperation> {
                 } else {
                     false
                 }
+            }
+            // For Offramp, enforce nonce == 0 for now (no nonce increment)
+            PismoOperation::Offramp { .. } => {
+                self.nonce == 0
             }
             // For CreateOrderbook, the account must exist and tx.nonce must equal current_nonce
             PismoOperation::CreateOrderbook { .. } => {

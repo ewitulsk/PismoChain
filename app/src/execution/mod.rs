@@ -19,6 +19,7 @@ use crate::{
         coin::{build_new_coin_updates, build_mint_updates, build_transfer_updates},
         orderbook::{build_create_orderbook_updates, build_new_limit_order_updates},
         onramp::build_onramp_updates,
+        offramp::build_offramp_updates,
         SignerType,
     },
 };
@@ -196,6 +197,26 @@ pub fn execute_transaction<K: KVStore>(
                 *coin_addr,
                 *receiver_addr,
                 *amount,
+                signing_pub_key,
+                signer_address,
+                signer_type,
+                signature_type,
+                pending_state
+            );
+            if !success {
+                return false;
+            }
+            pending_state.apply_jmt_writes(writes);
+            pending_state.apply_mirror_inserts(mirrors);
+            pending_state.apply_events(events);
+        }
+        
+        PismoOperation::Offramp { amount, coin_address, recipient_address, destination_chain } => {
+            let (success, (writes, mirrors, events)) = build_offramp_updates(
+                *amount,
+                *coin_address,
+                *recipient_address,
+                *destination_chain,
                 signing_pub_key,
                 signer_address,
                 signer_type,

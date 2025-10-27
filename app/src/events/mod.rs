@@ -40,6 +40,15 @@ pub struct TransferEvent {
     pub amount: u128,
 }
 
+/// Offramp event emitted when tokens are burned for bridge withdrawal
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+pub struct OfframpEvent {
+    pub amount: u64,
+    pub coin_address: [u8; 32],
+    pub recipient_address: [u8; 32],
+    pub destination_chain: u16,
+}
+
 /// Helper to create event key for storage
 /// Format: __event__{version:u64_be}_{event_index:u32_be}
 fn make_event_key(version: u64, event_index: u32) -> Vec<u8> {
